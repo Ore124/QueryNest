@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-knowledge-assistant-backend"
+version = "0.1.0"
+description = "FastAPI RAG assistant with LangChain, LangGraph, Milvus, BM25, RRF and Ragas."
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "python-dotenv>=1.0.1",
+  "pydantic-settings>=2.4.0",
+  "python-multipart>=0.0.9",
+  "langchain>=0.3.0",
+  "langchain-community>=0.3.0",
+  "langchain-openai>=0.2.0",
+  "langchain-text-splitters>=0.3.0",
+  "langgraph>=0.2.0",
+  "langgraph-checkpoint-sqlite>=2.0.0",
+  "pymilvus>=2.5.0,<3.0.0",
+  "rank-bm25>=0.2.2",
+  "jieba>=0.42.1",
+  "pymupdf>=1.24.0",
+  "pillow>=10.0.0",
+  "paddleocr==3.7.0",
+  "paddlepaddle==3.3.1",
+  "ragas>=0.2.0",
+  "datasets>=2.20.0",
+  "httpx>=0.27.0",
+  "redis>=5.0.0,<9.0.0",
+  "pytest>=8.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
