@@ -41,6 +41,13 @@ class IngestJobState:
 
 
 @dataclass(frozen=True)
+class ActiveChunkSnapshot:
+    kb_id: str
+    index_version: str
+    chunks: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
 class IndexConsistency:
     kb_id: str
     index_version: str | None
@@ -393,21 +400,29 @@ class PostgresMetadataStore:
                     (kb_id, index_version),
                 )
 
-    def load_active_chunks(self, kb_id: str) -> list[dict[str, Any]]:
+    def load_active_snapshot(self, kb_id: str) -> ActiveChunkSnapshot | None:
         with self._connect() as conn:
+            version_row = conn.execute(
+                """
+                SELECT index_version
+                FROM index_versions
+                WHERE kb_id = %s AND status = 'active'
+                """,
+                (kb_id,),
+            ).fetchone()
+            if version_row is None:
+                return None
+            index_version = str(version_row[0])
             rows = conn.execute(
                 """
                 SELECT c.chunk_id, c.text, c.metadata_json, c.index_version
                 FROM chunks c
-                JOIN index_versions iv
-                  ON iv.kb_id = c.kb_id
-                 AND iv.index_version = c.index_version
-                 AND iv.status = 'active'
                 WHERE c.kb_id = %s
+                  AND c.index_version = %s
                   AND c.deleted_at IS NULL
                 ORDER BY c.doc_id, c.chunk_index, c.chunk_id
                 """,
-                (kb_id,),
+                (kb_id, index_version),
             ).fetchall()
         chunks: list[dict[str, Any]] = []
         for row in rows:
@@ -416,7 +431,11 @@ class PostgresMetadataStore:
             metadata["kb_id"] = kb_id
             metadata["index_version"] = row[3]
             chunks.append({"chunk_id": row[0], "text": row[1], "metadata": metadata})
-        return chunks
+        return ActiveChunkSnapshot(kb_id=kb_id, index_version=index_version, chunks=chunks)
+
+    def load_active_chunks(self, kb_id: str) -> list[dict[str, Any]]:
+        snapshot = self.load_active_snapshot(kb_id)
+        return snapshot.chunks if snapshot is not None else []
 
     def active_index_version(self, kb_id: str) -> str | None:
         with self._connect() as conn:

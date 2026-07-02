@@ -48,15 +48,12 @@ cache_store = (
     if settings.redis_url
     else NullJsonCache()
 )
-metadata_store = PostgresMetadataStore(settings.postgres_dsn) if settings.postgres_dsn else None
-if metadata_store is not None:
-    metadata_store.run_migrations()
+metadata_store = PostgresMetadataStore(settings.postgres_dsn)
+metadata_store.run_migrations()
 rebuild_lock = (
     RedisKbRebuildLock(cache_store.client)
     if isinstance(cache_store, RedisJsonCache)
     else PostgresAdvisoryKbRebuildLock(metadata_store)
-    if metadata_store is not None
-    else None
 )
 base_embeddings = get_embeddings(settings)
 embeddings = (
@@ -235,75 +232,73 @@ def _ingest_from_path(path: Path, rebuild: bool, include_images: bool) -> Ingest
     job_state: IngestJobState | None = None
     source = _ingest_source(path, include_images=include_images)
     try:
-        if metadata_store is not None:
-            job_state = _claim_ingest_job(source)
-            if job_state.status != "queued":
-                return _active_ingest_response(job_state)
-            metadata_store.update_ingest_job(job_state.job_id, status="parsing")
-            metadata_store.upsert_document_status(
-                kb_id=settings.kb_id,
-                doc_id=source["doc_id"],
-                file_name=source["file_name"],
-                file_hash=source["file_hash"],
-                status="parsing",
-                parser="ingest-request",
-                parser_version=settings.parser_version,
-                metadata=source["metadata"],
-            )
+        job_state = _claim_ingest_job(source)
+        if job_state.status != "queued":
+            return _active_ingest_response(job_state)
+        metadata_store.update_ingest_job(job_state.job_id, status="parsing")
+        metadata_store.upsert_document_status(
+            kb_id=settings.kb_id,
+            doc_id=source["doc_id"],
+            file_name=source["file_name"],
+            file_hash=source["file_hash"],
+            status="parsing",
+            parser="ingest-request",
+            parser_version=settings.parser_version,
+            metadata=source["metadata"],
+        )
         raw_documents = load_documents(path, document_parsers, include_images=include_images)
         chunks = split_documents(raw_documents, settings.chunk_size, settings.chunk_overlap)
         if not chunks:
             raise HTTPException(status_code=400, detail="No supported documents found.")
-        if metadata_store is not None and job_state is not None:
-            metadata_store.update_ingest_job(job_state.job_id, status="embedding")
-            metadata_store.upsert_document_status(
-                kb_id=settings.kb_id,
-                doc_id=source["doc_id"],
-                file_name=source["file_name"],
-                file_hash=source["file_hash"],
-                status="embedding",
-                parser="ingest-request",
-                parser_version=settings.parser_version,
-                metadata=source["metadata"],
-            )
+        metadata_store.update_ingest_job(job_state.job_id, status="embedding")
+        metadata_store.upsert_document_status(
+            kb_id=settings.kb_id,
+            doc_id=source["doc_id"],
+            file_name=source["file_name"],
+            file_hash=source["file_hash"],
+            status="embedding",
+            parser="ingest-request",
+            parser_version=settings.parser_version,
+            metadata=source["metadata"],
+        )
         try:
             with _rebuild_lock_context(settings.kb_id, job_state):
                 hybrid_index.build(chunks, rebuild=rebuild)
-                if metadata_store is not None:
-                    metadata_store.write_index_snapshot(
-                        kb_id=settings.kb_id,
-                        index_version=hybrid_index.index_revision,
-                        raw_documents=raw_documents,
-                        chunks=chunks,
-                        embedding_model=settings.resolved_embedding_model,
-                        chunker_version=settings.chunker_version,
-                        parser_version=settings.parser_version,
-                        milvus_collection=settings.milvus_collection_name,
-                        milvus_sparse_field=MILVUS_SPARSE_FIELD,
-                    )
-                    if job_state is not None:
-                        metadata_store.upsert_document_status(
-                            kb_id=settings.kb_id,
-                            doc_id=source["doc_id"],
-                            file_name=source["file_name"],
-                            file_hash=source["file_hash"],
-                            status="indexed",
-                            parser="ingest-request",
-                            parser_version=settings.parser_version,
-                            metadata=source["metadata"],
-                        )
-                        metadata_store.update_ingest_job(job_state.job_id, status="completed")
+                metadata_store.write_index_snapshot(
+                    kb_id=settings.kb_id,
+                    index_version=hybrid_index.index_revision,
+                    raw_documents=raw_documents,
+                    chunks=chunks,
+                    embedding_model=settings.resolved_embedding_model,
+                    chunker_version=settings.chunker_version,
+                    parser_version=settings.parser_version,
+                    milvus_collection=settings.milvus_collection_name,
+                    milvus_sparse_field=MILVUS_SPARSE_FIELD,
+                )
+                hybrid_index.metadata_store = metadata_store
+                if not hybrid_index.load():
+                    raise RuntimeError("Index snapshot was written but PostgreSQL/Milvus hybrid reload failed.")
+                metadata_store.upsert_document_status(
+                    kb_id=settings.kb_id,
+                    doc_id=source["doc_id"],
+                    file_name=source["file_name"],
+                    file_hash=source["file_hash"],
+                    status="indexed",
+                    parser="ingest-request",
+                    parser_version=settings.parser_version,
+                    metadata=source["metadata"],
+                )
+                metadata_store.update_ingest_job(job_state.job_id, status="completed")
         except KbRebuildLockBusy as exc:
-            if metadata_store is not None and job_state is not None:
-                _mark_ingest_failed(job_state, source, _safe_error_message(exc))
+            _mark_ingest_failed(job_state, source, _safe_error_message(exc))
             return IngestResponse(
                 indexed_chunks=len(hybrid_index.chunks),
                 source_documents=0,
                 scenarios=hybrid_index.scenarios(),
                 artifact_dir=str(settings.resolved_artifact_dir),
                 notices=[],
-                doc_id=source["doc_id"] if metadata_store is not None else None,
-                ingest_job_id=job_state.job_id if job_state is not None else None,
+                doc_id=source["doc_id"],
+                ingest_job_id=job_state.job_id,
                 ingest_status="rebuild_locked",
             )
         return IngestResponse(
@@ -312,22 +307,21 @@ def _ingest_from_path(path: Path, rebuild: bool, include_images: bool) -> Ingest
             scenarios=hybrid_index.scenarios(),
             artifact_dir=str(settings.resolved_artifact_dir),
             notices=_ingest_notices(raw_documents),
-            doc_id=source["doc_id"] if metadata_store is not None else None,
-            ingest_job_id=job_state.job_id if job_state is not None else None,
-            ingest_status="completed" if job_state is not None else None,
+            doc_id=source["doc_id"],
+            ingest_job_id=job_state.job_id,
+            ingest_status="completed",
         )
     except HTTPException as exc:
-        if metadata_store is not None and job_state is not None:
+        if job_state is not None:
             _mark_ingest_failed(job_state, source, str(exc.detail))
         raise
     except Exception as exc:
-        if metadata_store is not None and job_state is not None:
+        if job_state is not None:
             _mark_ingest_failed(job_state, source, _safe_error_message(exc))
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 def _claim_ingest_job(source: dict[str, object]) -> IngestJobState:
-    assert metadata_store is not None
     active = metadata_store.get_active_ingest_job(str(source["doc_id"]))
     if active is not None:
         return active
@@ -458,7 +452,6 @@ def _active_ingest_response(job_state: IngestJobState) -> IngestResponse:
 
 
 def _mark_ingest_failed(job_state: IngestJobState, source: dict[str, object], message: str) -> None:
-    assert metadata_store is not None
     metadata_store.upsert_document_status(
         kb_id=settings.kb_id,
         doc_id=str(source["doc_id"]),

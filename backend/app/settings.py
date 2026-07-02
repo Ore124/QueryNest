@@ -131,6 +131,14 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("postgres_dsn")
+    @classmethod
+    def _require_postgres_dsn(cls, value: str) -> str:
+        dsn = value.strip()
+        if not dsn:
+            raise ValueError("POSTGRES_DSN is required. PostgreSQL is the knowledge-base metadata store.")
+        return dsn
+
     @property
     def root_dir(self) -> Path:
         return _project_root()

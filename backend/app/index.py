@@ -32,7 +32,7 @@ class Reranker(Protocol):
 class ChunkMetadataStore(Protocol):
     backend: str
 
-    def load_active_chunks(self, kb_id: str) -> list[dict[str, Any]]: ...
+    def load_active_snapshot(self, kb_id: str) -> Any | None: ...
 
 
 @dataclass(frozen=True)
@@ -110,19 +110,21 @@ class HybridIndex:
 
     def load(self) -> bool:
         if self.metadata_store is None:
-            return False
+            raise RuntimeError("PostgreSQL metadata store is required to load the knowledge base.")
         try:
             if not self._collection_exists():
                 return False
-            chunks = self.metadata_store.load_active_chunks(self.kb_id)
-            if not chunks:
+            if not self._collection_has_hybrid_schema():
+                return False
+            snapshot = self.metadata_store.load_active_snapshot(self.kb_id)
+            if snapshot is None or not snapshot.chunks:
                 return False
             self._load_collection()
         except Exception:
             return False
-        self.chunks = chunks
+        self.chunks = snapshot.chunks
         self.chunk_by_id = {chunk["chunk_id"]: chunk for chunk in self.chunks}
-        self.index_revision = self._calculate_revision()
+        self.index_revision = snapshot.index_version
         self.origin = "postgresql_milvus"
         return True
 
@@ -416,6 +418,31 @@ class HybridIndex:
             return bool(client.collection_exists(collection_name=self.milvus_collection_name))
         return self.milvus_collection_name in client.list_collections()
 
+    def _collection_has_hybrid_schema(self) -> bool:
+        client = self._client()
+        collection = getattr(client, "collections", {}).get(self.milvus_collection_name)
+        if isinstance(collection, dict) and collection.get("hybrid_schema") is not None:
+            return bool(collection["hybrid_schema"])
+        if not hasattr(client, "describe_collection"):
+            return False
+        description = client.describe_collection(collection_name=self.milvus_collection_name)
+        fields = description.get("fields", []) if isinstance(description, dict) else []
+        field_names = {str(field.get("name")) for field in fields if isinstance(field, dict)}
+        if not {MILVUS_ID_FIELD, MILVUS_TEXT_FIELD, MILVUS_VECTOR_FIELD, MILVUS_SPARSE_FIELD, "kb_id", "index_version"}.issubset(field_names):
+            return False
+        text_field = next((field for field in fields if isinstance(field, dict) and field.get("name") == MILVUS_TEXT_FIELD), {})
+        text_params = text_field.get("params", {}) if isinstance(text_field, dict) else {}
+        analyzer_enabled = str(text_params.get("enable_analyzer", "")).lower() == "true" or text_field.get("enable_analyzer") is True
+        functions = description.get("functions", []) if isinstance(description, dict) else []
+        has_bm25_function = any(
+            isinstance(function, dict)
+            and str(function.get("name", "")).lower() == "text_bm25"
+            and MILVUS_TEXT_FIELD in str(function.get("input_field_names", ""))
+            and MILVUS_SPARSE_FIELD in str(function.get("output_field_names", ""))
+            for function in functions
+        )
+        return analyzer_enabled and has_bm25_function
+
     def _load_collection(self) -> None:
         client = self._client()
         if hasattr(client, "load_collection"):
@@ -446,7 +473,7 @@ class HybridIndex:
             chunk_id = self._search_result_chunk_id(result)
             if chunk_id is None:
                 continue
-            chunk = self.chunk_by_id.get(chunk_id) or self._chunk_from_entity(result, chunk_id)
+            chunk = self.chunk_by_id.get(chunk_id)
             if chunk is None:
                 continue
             score = self._search_result_score(result)
@@ -466,26 +493,6 @@ class HybridIndex:
             if len(hits) >= top_k:
                 break
         return hits
-
-    def _chunk_from_entity(self, result: Any, chunk_id: str) -> dict[str, Any] | None:
-        entity = result.get("entity") if isinstance(result, dict) else getattr(result, "entity", None)
-        if not isinstance(entity, dict):
-            return None
-        text = entity.get(MILVUS_TEXT_FIELD)
-        if text is None:
-            return None
-        metadata = {
-            "chunk_id": chunk_id,
-            "source_path": entity.get("doc_id", ""),
-            "source_name": entity.get("doc_id", ""),
-            "file_type": "",
-            "scenario": entity.get("scenario", ""),
-            "page": entity.get("page_no"),
-            "chunk_index": entity.get("chunk_index"),
-            "kb_id": entity.get("kb_id", self.kb_id),
-            "index_version": entity.get("index_version", self.index_revision),
-        }
-        return {"chunk_id": chunk_id, "text": text, "metadata": metadata}
 
     @staticmethod
     def _search_result_chunk_id(result: Any) -> str | None:
@@ -620,65 +627,6 @@ class HybridIndex:
     def _embedding_cache_hit(self) -> bool | None:
         value = getattr(self.embeddings, "last_query_cache_hit", None)
         return value if isinstance(value, bool) else None
-
-
-def reciprocal_rank_fusion(
-    dense_hits: list[SearchHit],
-    bm25_hits: list[SearchHit],
-    *,
-    rrf_k: int,
-) -> list[SearchHit]:
-    by_id: dict[str, SearchHit] = {}
-    scores: dict[str, float] = {}
-    for rank, hit in enumerate(dense_hits, start=1):
-        by_id[hit.chunk_id] = SearchHit(
-            chunk_id=hit.chunk_id,
-            text=hit.text,
-            metadata=hit.metadata,
-            dense_rank=hit.dense_rank or rank,
-            bm25_rank=hit.bm25_rank,
-            dense_score=hit.dense_score,
-            bm25_score=hit.bm25_score,
-        )
-        scores[hit.chunk_id] = scores.get(hit.chunk_id, 0.0) + 1.0 / (rrf_k + rank)
-    for rank, hit in enumerate(bm25_hits, start=1):
-        existing = by_id.get(hit.chunk_id)
-        if existing:
-            by_id[hit.chunk_id] = SearchHit(
-                chunk_id=existing.chunk_id,
-                text=existing.text,
-                metadata=existing.metadata,
-                dense_rank=existing.dense_rank,
-                bm25_rank=hit.bm25_rank or rank,
-                dense_score=existing.dense_score,
-                bm25_score=hit.bm25_score,
-            )
-        else:
-            by_id[hit.chunk_id] = SearchHit(
-                chunk_id=hit.chunk_id,
-                text=hit.text,
-                metadata=hit.metadata,
-                dense_rank=hit.dense_rank,
-                bm25_rank=hit.bm25_rank or rank,
-                dense_score=hit.dense_score,
-                bm25_score=hit.bm25_score,
-            )
-        scores[hit.chunk_id] = scores.get(hit.chunk_id, 0.0) + 1.0 / (rrf_k + rank)
-    fused = [
-        SearchHit(
-            chunk_id=hit.chunk_id,
-            text=hit.text,
-            metadata=hit.metadata,
-            dense_rank=hit.dense_rank,
-            bm25_rank=hit.bm25_rank,
-            dense_score=hit.dense_score,
-            bm25_score=hit.bm25_score,
-            rrf_score=scores[chunk_id],
-        )
-        for chunk_id, hit in by_id.items()
-    ]
-    return sorted(fused, key=lambda hit: (-hit.rrf_score, hit.dense_rank or 10_000, hit.bm25_rank or 10_000, hit.chunk_id))
-
 
 def _escape_expr(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')

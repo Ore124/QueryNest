@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.documents import RawDocument
-from app.kb_metadata import ActiveIngestJobExists, IngestJobState
+from app.kb_metadata import ActiveChunkSnapshot, ActiveIngestJobExists, IngestJobState
 from app.rebuild_locks import KbRebuildLockBusy
 
 
@@ -21,6 +21,7 @@ class ConcurrentFakeMetadataStore:
         self.documents: dict[str, str] = {}
         self.failures: list[str] = []
         self.snapshots = 0
+        self.active_snapshot: ActiveChunkSnapshot | None = None
 
     def get_active_ingest_job(self, doc_id: str) -> IngestJobState | None:
         with self.lock:
@@ -72,9 +73,22 @@ class ConcurrentFakeMetadataStore:
                 if state.job_id == job_id:
                     del self.active_by_doc_id[doc_id]
 
-    def write_index_snapshot(self, **_: object) -> None:
+    def write_index_snapshot(self, **kwargs: object) -> None:
         with self.lock:
             self.snapshots += 1
+            kb_id = str(kwargs["kb_id"])
+            index_version = str(kwargs["index_version"])
+            chunks = [
+                {"chunk_id": chunk.chunk_id, "text": chunk.text, "metadata": {**dict(chunk.metadata), "kb_id": kb_id, "index_version": index_version}}
+                for chunk in kwargs["chunks"]
+            ]
+            self.active_snapshot = ActiveChunkSnapshot(kb_id=kb_id, index_version=index_version, chunks=chunks)
+
+    def load_active_snapshot(self, kb_id: str) -> ActiveChunkSnapshot | None:
+        with self.lock:
+            if self.active_snapshot is None or self.active_snapshot.kb_id != kb_id:
+                return None
+            return self.active_snapshot
 
 
 class NonBlockingFakeRebuildLock:

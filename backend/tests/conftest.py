@@ -19,7 +19,44 @@ class FakeMilvusClient:
         return FakeIndexParams()
 
     def create_collection(self, *, collection_name: str, dimension: int | None = None, schema: Any | None = None, **_: Any) -> None:
-        self.collections[collection_name] = {"dimension": dimension, "schema": schema, "rows": {}}
+        self.collections[collection_name] = {
+            "dimension": dimension,
+            "schema": schema,
+            "hybrid_schema": schema is not None,
+            "rows": {},
+        }
+
+    def describe_collection(self, *, collection_name: str) -> dict[str, Any]:
+        collection = self.collections[collection_name]
+        if not collection.get("hybrid_schema"):
+            return {
+                "fields": [
+                    {"name": "chunk_id", "params": {}},
+                    {"name": "embedding", "params": {}},
+                ],
+                "functions": [],
+            }
+        return {
+            "fields": [
+                {"name": "chunk_id", "params": {}},
+                {"name": "kb_id", "params": {}},
+                {"name": "doc_id", "params": {}},
+                {"name": "index_version", "params": {}},
+                {"name": "scenario", "params": {}},
+                {"name": "page_no", "params": {}},
+                {"name": "chunk_index", "params": {}},
+                {"name": "text", "params": {"enable_analyzer": "true"}},
+                {"name": "dense", "params": {}},
+                {"name": "sparse", "params": {}},
+            ],
+            "functions": [
+                {
+                    "name": "text_bm25",
+                    "input_field_names": "['text']",
+                    "output_field_names": "['sparse']",
+                }
+            ],
+        }
 
     def insert(self, *, collection_name: str, data: list[dict[str, Any]]) -> None:
         rows = self.collections[collection_name]["rows"]

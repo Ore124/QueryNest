@@ -276,6 +276,7 @@ def test_hybrid_index_load_uses_postgres_and_does_not_fallback_to_local_artifact
         milvus_client=fake_milvus_client,
         kb_id=kb_id,
     )
-    assert fallback_loaded.load() is False
+    with pytest.raises(RuntimeError, match="PostgreSQL metadata store is required"):
+        fallback_loaded.load()
     assert fallback_loaded.origin == "not_loaded"
     assert fallback_loaded.chunks == []
