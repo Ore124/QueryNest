@@ -45,3 +45,6 @@ app = ["migrations/*.sql"]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
+markers = [
+  "integration: tests that require external services such as PostgreSQL",
+]

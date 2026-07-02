@@ -95,10 +95,35 @@ class PostgresMetadataStore:
                     (job_id, doc_id, kb_id, worker_id),
                 )
         except Exception as exc:
-            if "idx_ingest_jobs_one_active_doc" in str(exc):
+            if _constraint_name(exc) == "idx_ingest_jobs_one_active_doc":
                 raise ActiveIngestJobExists(f"active ingest job already exists for doc_id={doc_id}") from exc
             raise
         return job_id
+
+    def update_ingest_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        retry_count: int | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status = %s,
+                    retry_count = COALESCE(%s, retry_count),
+                    error_message = %s,
+                    updated_at = now(),
+                    finished_at = CASE
+                        WHEN %s IN ('completed', 'failed', 'cancelled') THEN now()
+                        ELSE finished_at
+                    END
+                WHERE job_id = %s
+                """,
+                (status, retry_count, error_message, status, job_id),
+            )
 
     def write_index_snapshot(
         self,
@@ -477,3 +502,9 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _constraint_name(exc: Exception) -> str | None:
+    diag = getattr(exc, "diag", None)
+    value = getattr(diag, "constraint_name", None)
+    return str(value) if value is not None else None
