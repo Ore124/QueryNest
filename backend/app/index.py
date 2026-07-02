@@ -30,6 +30,12 @@ class Reranker(Protocol):
     def rerank(self, query: str, documents: list[str], top_n: int) -> list[RerankResult]: ...
 
 
+class ChunkMetadataStore(Protocol):
+    backend: str
+
+    def load_active_chunks(self, kb_id: str) -> list[dict[str, Any]]: ...
+
+
 @dataclass(frozen=True)
 class SearchHit:
     chunk_id: str
@@ -59,6 +65,9 @@ class HybridIndex:
         milvus_collection_name: str = "rag_chunks",
         embedding_dimensions: int | None = None,
         milvus_client: Any | None = None,
+        metadata_store: ChunkMetadataStore | None = None,
+        kb_id: str = "default",
+        bm25_backend: str = "local",
     ) -> None:
         self.index_dir = index_dir
         self.embeddings = embeddings
@@ -71,6 +80,9 @@ class HybridIndex:
         self.milvus_collection_name = milvus_collection_name
         self.embedding_dimensions = embedding_dimensions
         self._milvus_client = milvus_client
+        self.metadata_store = metadata_store
+        self.kb_id = kb_id
+        self.bm25_backend = bm25_backend
         self.dense_ready = False
         self.bm25: BM25Okapi | None = None
         self.tokenized_corpus: list[list[str]] = []
@@ -88,23 +100,31 @@ class HybridIndex:
         if rebuild and self.index_dir.exists():
             shutil.rmtree(self.index_dir)
         self.index_dir.mkdir(parents=True, exist_ok=True)
-        texts = [chunk.text for chunk in chunks]
-        ids = [chunk.chunk_id for chunk in chunks]
-        self._build_dense_collection(texts, ids)
-        self.tokenized_corpus = [tokenize_for_bm25(text) for text in texts]
-        self.bm25 = BM25Okapi(self.tokenized_corpus)
-        self.chunks = [
-            {"chunk_id": chunk.chunk_id, "text": chunk.text, "metadata": chunk.metadata}
+        chunk_rows = [
+            {"chunk_id": chunk.chunk_id, "text": chunk.text, "metadata": dict(chunk.metadata)}
             for chunk in chunks
         ]
+        index_version = self._calculate_chunks_revision(chunk_rows)
+        for row in chunk_rows:
+            row["metadata"]["kb_id"] = self.kb_id
+            row["metadata"]["index_version"] = index_version
+        texts = [chunk.text for chunk in chunks]
+        ids = [chunk.chunk_id for chunk in chunks]
+        self._build_dense_collection(texts, ids, chunk_rows)
+        self.tokenized_corpus = [tokenize_for_bm25(text) for text in texts]
+        self.bm25 = BM25Okapi(self.tokenized_corpus)
+        self.chunks = chunk_rows
         self.chunk_by_id = {chunk["chunk_id"]: chunk for chunk in self.chunks}
-        self.index_revision = self._calculate_revision()
+        self.index_revision = index_version
         self.origin = "rebuilt"
         self.build_count += 1
         self._save_bm25()
         self._save_chunks()
+        self._save_manifest()
 
     def load(self) -> bool:
+        if self.metadata_store is not None and self._load_from_metadata_store():
+            return True
         bm25_path = self.index_dir / "bm25.pkl"
         chunks_path = self.index_dir / "chunks.jsonl"
         if not bm25_path.exists() or not chunks_path.exists():
@@ -270,6 +290,8 @@ class HybridIndex:
         return hits
 
     def _bm25_search(self, query: str, top_k: int, scenario: str | None) -> list[SearchHit]:
+        if self.bm25_backend == "milvus":
+            raise RuntimeError("Milvus BM25 backend is not enabled in this build; set retrieval.bm25_backend to 'local'.")
         assert self.bm25 is not None
         scores = self.bm25.get_scores(tokenize_for_bm25(query))
         candidates = sorted(enumerate(scores), key=lambda item: (-float(item[1]), item[0]))
@@ -292,7 +314,7 @@ class HybridIndex:
                 break
         return hits
 
-    def _build_dense_collection(self, texts: list[str], ids: list[str]) -> None:
+    def _build_dense_collection(self, texts: list[str], ids: list[str], chunks: list[dict[str, Any]]) -> None:
         vectors = self.embeddings.embed_documents(texts)
         if not vectors:
             self.dense_ready = False
@@ -310,6 +332,7 @@ class HybridIndex:
             metric_type=MILVUS_METRIC_TYPE,
             auto_id=False,
             max_length=512,
+            enable_dynamic_field=True,
         )
         client.insert(
             collection_name=self.milvus_collection_name,
@@ -317,8 +340,14 @@ class HybridIndex:
                 {
                     MILVUS_ID_FIELD: chunk_id,
                     MILVUS_VECTOR_FIELD: vector,
+                    "doc_id": str(chunk["metadata"].get("source_path", "")),
+                    "kb_id": self.kb_id,
+                    "index_version": str(chunk["metadata"].get("index_version", "")),
+                    "text": str(chunk.get("text", "")),
+                    "page_no": chunk["metadata"].get("page"),
+                    "chunk_index": chunk["metadata"].get("chunk_index"),
                 }
-                for chunk_id, vector in zip(ids, vectors, strict=True)
+                for chunk_id, vector, chunk in zip(ids, vectors, chunks, strict=True)
             ],
         )
         client.flush(collection_name=self.milvus_collection_name)
@@ -349,6 +378,17 @@ class HybridIndex:
         if hasattr(client, "load_collection"):
             client.load_collection(collection_name=self.milvus_collection_name)
         self.dense_ready = True
+
+    def vector_count(self) -> int | None:
+        client = self._client()
+        collection = getattr(client, "collections", {}).get(self.milvus_collection_name)
+        if isinstance(collection, dict) and isinstance(collection.get("rows"), dict):
+            return len(collection["rows"])
+        if hasattr(client, "get_collection_stats"):
+            stats = client.get_collection_stats(collection_name=self.milvus_collection_name)
+            if isinstance(stats, dict) and stats.get("row_count") is not None:
+                return int(stats["row_count"])
+        return None
 
     @staticmethod
     def _search_result_chunk_id(result: Any) -> str | None:
@@ -438,6 +478,37 @@ class HybridIndex:
             for chunk in self.chunks:
                 stream.write(json.dumps(chunk, ensure_ascii=False) + "\n")
 
+    def _save_manifest(self) -> None:
+        payload = {
+            "kb_id": self.kb_id,
+            "index_version": self.index_revision,
+            "source": "postgresql" if self.metadata_store is not None else "local",
+            "chunk_count": len(self.chunks),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "checksum": self.index_revision,
+            "bm25_backend": self.bm25_backend,
+        }
+        with (self.index_dir / "manifest.json").open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, sort_keys=True, indent=2)
+
+    def _load_from_metadata_store(self) -> bool:
+        try:
+            if not self._collection_exists():
+                return False
+            chunks = self.metadata_store.load_active_chunks(self.kb_id) if self.metadata_store else []
+            if not chunks:
+                return False
+            self._load_dense_collection()
+        except Exception:
+            return False
+        self.chunks = chunks
+        self.chunk_by_id = {chunk["chunk_id"]: chunk for chunk in self.chunks}
+        self.tokenized_corpus = [tokenize_for_bm25(str(chunk["text"])) for chunk in self.chunks]
+        self.bm25 = BM25Okapi(self.tokenized_corpus)
+        self.index_revision = self._calculate_revision()
+        self.origin = "postgresql"
+        return True
+
     def _retrieval_cache_payload(
         self,
         *,
@@ -461,15 +532,22 @@ class HybridIndex:
         }
 
     def _calculate_revision(self) -> str:
+        return self._calculate_chunks_revision(self.chunks)
+
+    @staticmethod
+    def _calculate_chunks_revision(chunks: list[dict[str, Any]]) -> str:
         digest = hashlib.sha256()
-        for chunk in sorted(self.chunks, key=lambda item: str(item["chunk_id"])):
+        for chunk in sorted(chunks, key=lambda item: str(item["chunk_id"])):
+            metadata = dict(chunk.get("metadata", {}))
+            metadata.pop("kb_id", None)
+            metadata.pop("index_version", None)
             digest.update(str(chunk["chunk_id"]).encode("utf-8"))
             digest.update(b"\0")
             digest.update(str(chunk["text"]).encode("utf-8"))
             digest.update(b"\0")
             digest.update(
                 json.dumps(
-                    chunk.get("metadata", {}),
+                    metadata,
                     ensure_ascii=False,
                     sort_keys=True,
                     default=str,
