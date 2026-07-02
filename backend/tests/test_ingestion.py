@@ -53,7 +53,7 @@ def test_ingestion_loads_supported_types_and_keeps_indexes_aligned(tmp_path, fak
     index.build(chunks)
 
     assert len(chunks) > 0
-    assert len(index.chunks) == len(index.tokenized_corpus)
+    assert len(index.chunks) == len(chunks)
     assert index.ready
     assert index.scenarios() == ["制度与流程"]
 

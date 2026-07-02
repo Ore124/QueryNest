@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rag-knowledge-assistant-backend"
 version = "0.1.0"
-description = "FastAPI RAG assistant with LangChain, LangGraph, Milvus, BM25, RRF and Ragas."
+description = "FastAPI RAG assistant with LangChain, LangGraph, PostgreSQL metadata, Milvus hybrid search, RRF and Ragas."
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115.0",
@@ -20,7 +20,6 @@ dependencies = [
   "langgraph>=0.2.0",
   "langgraph-checkpoint-sqlite>=2.0.0",
   "pymilvus>=2.5.0,<3.0.0",
-  "rank-bm25>=0.2.2",
   "jieba>=0.42.1",
   "pymupdf>=1.24.0",
   "pillow>=10.0.0",

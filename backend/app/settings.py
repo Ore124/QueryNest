@@ -67,18 +67,17 @@ class Settings(BaseSettings):
     embedding_model: str = Field(default="", alias="EMBEDDING_MODEL")
     embedding_api_key: str = Field(default="", alias="EMBEDDING_API_KEY")
     embedding_base_url: str = Field(default="", alias="EMBEDDING_BASE_URL")
-    index_dir: Path = Field(
-        default=Path(".rag_index"),
-        validation_alias=AliasChoices("INDEX_DIR", "FAISS_INDEX_DIR"),
+    artifact_dir: Path = Field(
+        default=Path(".rag_artifacts"),
+        validation_alias=AliasChoices("ARTIFACT_DIR"),
     )
     milvus_uri: str = Field(default="http://127.0.0.1:19530", alias="MILVUS_URI")
     milvus_token: str = Field(default="", alias="MILVUS_TOKEN")
     milvus_collection_name: str = Field(default="rag_chunks", alias="MILVUS_COLLECTION_NAME")
-    postgres_dsn: str = Field(default="", alias="POSTGRES_DSN")
+    postgres_dsn: str = Field(default="postgresql://rag:rag_dev_password@127.0.0.1:5432/rag", alias="POSTGRES_DSN")
     kb_id: str = Field(default="default", alias="KB_ID")
     parser_version: str = Field(default="document-parsers-v1", alias="PARSER_VERSION")
     chunker_version: str = Field(default="recursive-character-v1", alias="CHUNKER_VERSION")
-    retrieval_bm25_backend: str = Field(default="local", alias="RETRIEVAL_BM25_BACKEND")
     sqlite_path: Path = Field(default=Path(".sessions/rag_chat.sqlite3"), alias="SQLITE_PATH")
     default_source_path: Path = Field(default=Path(r"D:\Codex Projects\knowledge"), alias="DEFAULT_SOURCE_PATH")
     frontend_origin: str = Field(default="http://localhost:5173", alias="FRONTEND_ORIGIN")
@@ -132,21 +131,13 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("retrieval_bm25_backend")
-    @classmethod
-    def _valid_bm25_backend(cls, value: str) -> str:
-        backend = value.strip().lower()
-        if backend not in {"local", "milvus"}:
-            raise ValueError("RETRIEVAL_BM25_BACKEND must be 'local' or 'milvus'.")
-        return backend
-
     @property
     def root_dir(self) -> Path:
         return _project_root()
 
     @property
-    def resolved_index_dir(self) -> Path:
-        return self.index_dir if self.index_dir.is_absolute() else self.root_dir / self.index_dir
+    def resolved_artifact_dir(self) -> Path:
+        return self.artifact_dir if self.artifact_dir.is_absolute() else self.root_dir / self.artifact_dir
 
     @property
     def resolved_sqlite_path(self) -> Path:

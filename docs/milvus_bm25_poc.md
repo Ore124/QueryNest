@@ -2,7 +2,7 @@
 
 ## Scope
 
-This POC is isolated from the production retrieval path. It does not change `HybridIndex`, `retrieval.bm25_backend`, or the local BM25 fallback.
+This POC validated the Milvus APIs now used by the production retrieval path. `HybridIndex` uses the same dense field, analyzer-enabled text field, sparse BM25 field, and hybrid search pattern.
 
 Script:
 
@@ -135,4 +135,4 @@ For API 500 incidents, check traceId, error logs, and recent deployments.
 
 ## Recommendation
 
-Milvus BM25 / sparse / hybrid search is supported in the current local stack. The next implementation step should still remain behind `RETRIEVAL_BM25_BACKEND=milvus` and should use a new versioned collection schema or a new collection name, because the current production dense collection schema does not include analyzer-enabled text or sparse BM25 fields.
+Milvus BM25 / sparse / hybrid search is supported in the current local stack. Production retrieval now depends on this capability and no longer includes a local BM25 fallback.

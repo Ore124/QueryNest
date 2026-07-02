@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS retrieval_logs (
     kb_id TEXT NOT NULL REFERENCES knowledge_bases(kb_id),
     index_version TEXT,
     query_hash TEXT NOT NULL,
-    bm25_backend TEXT NOT NULL,
+    retrieval_backend TEXT NOT NULL,
     dense_top_k INTEGER NOT NULL,
     bm25_top_k INTEGER NOT NULL,
     final_top_k INTEGER NOT NULL,

@@ -144,7 +144,11 @@ def test_postgres_migrations_are_repeatable(postgres_schema: str, psycopg_module
             ).fetchall()
         }
 
-    assert versions == [("001_kb_metadata",), ("002_ingest_job_active_statuses",)]
+    assert versions == [
+        ("001_kb_metadata",),
+        ("002_ingest_job_active_statuses",),
+        ("003_retrieval_logs_backend_column",),
+    ]
     assert {"documents", "chunks", "index_versions", "ingest_jobs"}.issubset(tables)
 
 
@@ -226,7 +230,7 @@ def test_doc_id_allows_only_one_active_ingest_job(pg_store: PostgresMetadataStor
     assert second_job_id != first_job_id
 
 
-def test_hybrid_index_load_prefers_postgres_when_store_configured_and_falls_back_to_rag_index(
+def test_hybrid_index_load_uses_postgres_and_does_not_fallback_to_local_artifacts(
     pg_store: PostgresMetadataStore,
     tmp_path,
     fake_milvus_client,
@@ -263,7 +267,7 @@ def test_hybrid_index_load_prefers_postgres_when_store_configured_and_falls_back
         kb_id=kb_id,
     )
     assert postgres_loaded.load() is True
-    assert postgres_loaded.origin == "postgresql"
+    assert postgres_loaded.origin == "postgresql_milvus"
     assert postgres_loaded.chunks[0]["text"] == "postgres source alpha"
 
     fallback_loaded = HybridIndex(
@@ -272,6 +276,6 @@ def test_hybrid_index_load_prefers_postgres_when_store_configured_and_falls_back
         milvus_client=fake_milvus_client,
         kb_id=kb_id,
     )
-    assert fallback_loaded.load() is True
-    assert fallback_loaded.origin == "milvus"
-    assert fallback_loaded.chunks[0]["text"] == "local artifact alpha"
+    assert fallback_loaded.load() is False
+    assert fallback_loaded.origin == "not_loaded"
+    assert fallback_loaded.chunks == []

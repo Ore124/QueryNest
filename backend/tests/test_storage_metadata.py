@@ -64,7 +64,7 @@ def test_metadata_migration_defines_required_tables_and_active_job_guard():
     assert "WHERE status = 'active'" in sql
 
 
-def test_hybrid_index_writes_index_version_to_milvus_rows_and_manifest(tmp_path, fake_milvus_client):
+def test_hybrid_index_writes_versioned_rows_to_milvus_without_rag_index_artifacts(tmp_path, fake_milvus_client):
     index = HybridIndex(
         tmp_path / "index",
         HashEmbeddings(dimensions=32),
@@ -78,10 +78,12 @@ def test_hybrid_index_writes_index_version_to_milvus_rows_and_manifest(tmp_path,
     assert set(rows) == {"chunk-a", "chunk-b"}
     assert {row["kb_id"] for row in rows.values()} == {"kb-test"}
     assert {row["index_version"] for row in rows.values()} == {index.index_revision}
-    assert (tmp_path / "index" / "manifest.json").exists()
+    assert {row["text"] for row in rows.values()} == {chunk.text for chunk in _chunks()}
+    assert not (tmp_path / "index" / "chunks.jsonl").exists()
+    assert not (tmp_path / "index" / "bm25.pkl").exists()
 
 
-def test_hybrid_index_loads_chunk_metadata_from_postgres_before_rag_index(tmp_path, fake_milvus_client):
+def test_hybrid_index_loads_chunk_metadata_from_postgres(tmp_path, fake_milvus_client):
     first = HybridIndex(
         tmp_path / "index",
         HashEmbeddings(dimensions=32),
@@ -104,8 +106,6 @@ def test_hybrid_index_loads_chunk_metadata_from_postgres_before_rag_index(tmp_pa
             },
         }
     ]
-    (tmp_path / "index" / "chunks.jsonl").unlink()
-
     loaded = HybridIndex(
         tmp_path / "index",
         HashEmbeddings(dimensions=32),
@@ -115,17 +115,16 @@ def test_hybrid_index_loads_chunk_metadata_from_postgres_before_rag_index(tmp_pa
     )
 
     assert loaded.load() is True
-    assert loaded.origin == "postgresql"
+    assert loaded.origin == "postgresql_milvus"
     assert loaded.chunks[0]["text"] == "postgres is the metadata source"
     assert loaded.ready
 
 
-def test_local_bm25_backend_still_supports_rollback(tmp_path, fake_milvus_client):
+def test_milvus_hybrid_search_returns_dense_and_bm25_rank_details(tmp_path, fake_milvus_client):
     index = HybridIndex(
         tmp_path / "index",
         HashEmbeddings(dimensions=32),
         milvus_client=fake_milvus_client,
-        bm25_backend="local",
     )
     index.build(_chunks())
 
@@ -139,4 +138,6 @@ def test_local_bm25_backend_still_supports_rollback(tmp_path, fake_milvus_client
     )
 
     assert sources
+    assert debug["retrieval_backend"] == "milvus_hybrid"
     assert debug["bm25_hits"]
+    assert any(source.bm25_rank is not None for source in sources)

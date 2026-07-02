@@ -17,7 +17,7 @@ from .documents import discover_files, load_documents, split_documents
 from .graph import RagService
 from .history import ChatHistoryStore, RedisChatHistoryStore
 from .image_ocr import PaddleOcrParser
-from .index import HybridIndex
+from .index import HybridIndex, MILVUS_SPARSE_FIELD
 from .kb_metadata import ActiveIngestJobExists, IngestJobState, PostgresMetadataStore
 from .mineru_api_client import MineruApiClient, MineruApiClientConfig
 from .pdf_parse_router import PdfParseRouter, PdfParseRouterConfig
@@ -72,7 +72,7 @@ embeddings = (
 )
 reranker = create_reranker(settings)
 hybrid_index = HybridIndex(
-    settings.resolved_index_dir,
+    settings.resolved_artifact_dir,
     embeddings,
     reranker=reranker,
     rerank_candidate_top_k=settings.rerank_candidate_top_k,
@@ -84,7 +84,6 @@ hybrid_index = HybridIndex(
     embedding_dimensions=settings.resolved_embedding_dimensions,
     metadata_store=metadata_store,
     kb_id=settings.kb_id,
-    bm25_backend=settings.retrieval_bm25_backend,
 )
 hybrid_index.load()
 history_store = (
@@ -280,6 +279,7 @@ def _ingest_from_path(path: Path, rebuild: bool, include_images: bool) -> Ingest
                         chunker_version=settings.chunker_version,
                         parser_version=settings.parser_version,
                         milvus_collection=settings.milvus_collection_name,
+                        milvus_sparse_field=MILVUS_SPARSE_FIELD,
                     )
                     if job_state is not None:
                         metadata_store.upsert_document_status(
@@ -300,7 +300,7 @@ def _ingest_from_path(path: Path, rebuild: bool, include_images: bool) -> Ingest
                 indexed_chunks=len(hybrid_index.chunks),
                 source_documents=0,
                 scenarios=hybrid_index.scenarios(),
-                index_dir=str(settings.resolved_index_dir),
+                artifact_dir=str(settings.resolved_artifact_dir),
                 notices=[],
                 doc_id=source["doc_id"] if metadata_store is not None else None,
                 ingest_job_id=job_state.job_id if job_state is not None else None,
@@ -310,7 +310,7 @@ def _ingest_from_path(path: Path, rebuild: bool, include_images: bool) -> Ingest
             indexed_chunks=len(chunks),
             source_documents=len(raw_documents),
             scenarios=hybrid_index.scenarios(),
-            index_dir=str(settings.resolved_index_dir),
+            artifact_dir=str(settings.resolved_artifact_dir),
             notices=_ingest_notices(raw_documents),
             doc_id=source["doc_id"] if metadata_store is not None else None,
             ingest_job_id=job_state.job_id if job_state is not None else None,
@@ -449,7 +449,7 @@ def _active_ingest_response(job_state: IngestJobState) -> IngestResponse:
         indexed_chunks=len(hybrid_index.chunks),
         source_documents=0,
         scenarios=hybrid_index.scenarios(),
-        index_dir=str(settings.resolved_index_dir),
+        artifact_dir=str(settings.resolved_artifact_dir),
         notices=[],
         doc_id=job_state.doc_id,
         ingest_job_id=job_state.job_id,
