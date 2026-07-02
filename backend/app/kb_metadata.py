@@ -29,6 +29,17 @@ class ActiveIngestJobExists(RuntimeError):
 
 
 @dataclass(frozen=True)
+class IngestJobState:
+    job_id: str
+    doc_id: str
+    kb_id: str
+    status: str
+    worker_id: str | None
+    retry_count: int
+    error_message: str | None
+
+
+@dataclass(frozen=True)
 class IndexConsistency:
     kb_id: str
     index_version: str | None
@@ -83,6 +94,67 @@ class PostgresMetadataStore:
                 (kb_id, name or kb_id),
             )
 
+    def upsert_document_status(
+        self,
+        *,
+        kb_id: str,
+        doc_id: str,
+        file_name: str,
+        file_hash: str,
+        status: str,
+        parser: str,
+        parser_version: str,
+        metadata: dict[str, Any] | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO knowledge_bases(kb_id, name, status)
+                VALUES (%s, %s, 'active')
+                ON CONFLICT (kb_id) DO UPDATE
+                SET updated_at = now(), deleted_at = NULL
+                """,
+                (kb_id, kb_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO documents(
+                    doc_id,
+                    kb_id,
+                    file_name,
+                    file_hash,
+                    status,
+                    parser,
+                    parser_version,
+                    error_message,
+                    metadata_json
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (doc_id) DO UPDATE
+                SET file_name = EXCLUDED.file_name,
+                    file_hash = EXCLUDED.file_hash,
+                    status = EXCLUDED.status,
+                    parser = EXCLUDED.parser,
+                    parser_version = EXCLUDED.parser_version,
+                    error_message = EXCLUDED.error_message,
+                    metadata_json = EXCLUDED.metadata_json,
+                    updated_at = now(),
+                    deleted_at = NULL
+                """,
+                (
+                    doc_id,
+                    kb_id,
+                    file_name,
+                    file_hash,
+                    status,
+                    parser,
+                    parser_version,
+                    error_message,
+                    _json(metadata or {}),
+                ),
+            )
+
     def create_ingest_job(self, *, kb_id: str, doc_id: str, worker_id: str | None = None) -> str:
         job_id = str(uuid.uuid4())
         try:
@@ -99,6 +171,21 @@ class PostgresMetadataStore:
                 raise ActiveIngestJobExists(f"active ingest job already exists for doc_id={doc_id}") from exc
             raise
         return job_id
+
+    def get_active_ingest_job(self, doc_id: str) -> IngestJobState | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT job_id, doc_id, kb_id, status, worker_id, retry_count, error_message
+                FROM ingest_jobs
+                WHERE doc_id = %s
+                  AND status IN ('queued', 'running', 'uploading', 'parsing', 'embedding')
+                ORDER BY created_at
+                LIMIT 1
+                """,
+                (doc_id,),
+            ).fetchone()
+        return _job_state(row) if row else None
 
     def update_ingest_job(
         self,
@@ -123,6 +210,21 @@ class PostgresMetadataStore:
                 WHERE job_id = %s
                 """,
                 (status, retry_count, error_message, status, job_id),
+            )
+
+    def fail_ingest_job(self, job_id: str, *, error_message: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status = 'failed',
+                    retry_count = retry_count + 1,
+                    error_message = %s,
+                    updated_at = now(),
+                    finished_at = now()
+                WHERE job_id = %s
+                """,
+                (error_message, job_id),
             )
 
     def write_index_snapshot(
@@ -508,3 +610,15 @@ def _constraint_name(exc: Exception) -> str | None:
     diag = getattr(exc, "diag", None)
     value = getattr(diag, "constraint_name", None)
     return str(value) if value is not None else None
+
+
+def _job_state(row: Any) -> IngestJobState:
+    return IngestJobState(
+        job_id=str(row[0]),
+        doc_id=str(row[1]),
+        kb_id=str(row[2]),
+        status=str(row[3]),
+        worker_id=str(row[4]) if row[4] is not None else None,
+        retry_count=int(row[5]),
+        error_message=str(row[6]) if row[6] is not None else None,
+    )

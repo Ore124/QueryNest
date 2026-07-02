@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import uuid
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import pytest
 
@@ -30,7 +30,7 @@ def _schema_dsn(base_dsn: str, schema: str) -> str:
         params = dict(parse_qsl(parsed.query, keep_blank_values=True))
         params["options"] = f"-c search_path={schema}"
         params.setdefault("connect_timeout", "3")
-        return urlunparse(parsed._replace(query=urlencode(params)))
+        return urlunparse(parsed._replace(query=urlencode(params, quote_via=quote)))
     return f"{base_dsn} connect_timeout=3 options='-c search_path={schema}'"
 
 
@@ -144,7 +144,7 @@ def test_postgres_migrations_are_repeatable(postgres_schema: str, psycopg_module
             ).fetchall()
         }
 
-    assert versions == [("001_kb_metadata",)]
+    assert versions == [("001_kb_metadata",), ("002_ingest_job_active_statuses",)]
     assert {"documents", "chunks", "index_versions", "ingest_jobs"}.issubset(tables)
 
 

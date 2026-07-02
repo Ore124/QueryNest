@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS ingest_jobs (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ingest_jobs_one_active_doc
     ON ingest_jobs(doc_id)
-    WHERE status IN ('queued', 'running');
+    WHERE status IN ('queued', 'running', 'uploading', 'parsing', 'embedding');
 
 CREATE INDEX IF NOT EXISTS idx_ingest_jobs_kb_status
     ON ingest_jobs(kb_id, status);

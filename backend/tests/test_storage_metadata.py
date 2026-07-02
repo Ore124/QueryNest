@@ -59,7 +59,7 @@ def test_metadata_migration_defines_required_tables_and_active_job_guard():
     ]:
         assert f"CREATE TABLE IF NOT EXISTS {table}" in sql
     assert "idx_ingest_jobs_one_active_doc" in sql
-    assert "WHERE status IN ('queued', 'running')" in sql
+    assert "WHERE status IN ('queued', 'running', 'uploading', 'parsing', 'embedding')" in sql
     assert "idx_index_versions_one_active" in sql
     assert "WHERE status = 'active'" in sql
 

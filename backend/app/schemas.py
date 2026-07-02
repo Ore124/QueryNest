@@ -41,6 +41,10 @@ class IngestResponse(BaseModel):
     source_documents: int
     scenarios: list[str]
     index_dir: str
+    notices: list[str] = Field(default_factory=list)
+    doc_id: str | None = None
+    ingest_job_id: str | None = None
+    ingest_status: str | None = None
 
 
 class ChatRequest(BaseModel):

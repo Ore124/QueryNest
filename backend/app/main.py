@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import threading
 import uuid
@@ -10,12 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .cache import NullJsonCache, RedisJsonCache
 from .document_parsers import DocumentParserRouter
-from .documents import load_documents, split_documents
+from .documents import discover_files, load_documents, split_documents
 from .graph import RagService
 from .history import ChatHistoryStore, RedisChatHistoryStore
 from .image_ocr import PaddleOcrParser
 from .index import HybridIndex
-from .kb_metadata import PostgresMetadataStore
+from .kb_metadata import ActiveIngestJobExists, IngestJobState, PostgresMetadataStore
 from .mineru_api_client import MineruApiClient, MineruApiClientConfig
 from .pdf_parse_router import PdfParseRouter, PdfParseRouterConfig
 from .providers import CachedEmbeddings, get_embeddings
@@ -221,11 +222,40 @@ def _safe_upload_target(upload_dir: Path, filename: str | None) -> Path:
 
 
 def _ingest_from_path(path: Path, rebuild: bool, include_images: bool) -> IngestResponse:
+    job_state: IngestJobState | None = None
+    source = _ingest_source(path, include_images=include_images)
     try:
+        if metadata_store is not None:
+            job_state = _claim_ingest_job(source)
+            if job_state.status != "queued":
+                return _active_ingest_response(job_state)
+            metadata_store.update_ingest_job(job_state.job_id, status="parsing")
+            metadata_store.upsert_document_status(
+                kb_id=settings.kb_id,
+                doc_id=source["doc_id"],
+                file_name=source["file_name"],
+                file_hash=source["file_hash"],
+                status="parsing",
+                parser="ingest-request",
+                parser_version=settings.parser_version,
+                metadata=source["metadata"],
+            )
         raw_documents = load_documents(path, document_parsers, include_images=include_images)
         chunks = split_documents(raw_documents, settings.chunk_size, settings.chunk_overlap)
         if not chunks:
             raise HTTPException(status_code=400, detail="No supported documents found.")
+        if metadata_store is not None and job_state is not None:
+            metadata_store.update_ingest_job(job_state.job_id, status="embedding")
+            metadata_store.upsert_document_status(
+                kb_id=settings.kb_id,
+                doc_id=source["doc_id"],
+                file_name=source["file_name"],
+                file_hash=source["file_hash"],
+                status="embedding",
+                parser="ingest-request",
+                parser_version=settings.parser_version,
+                metadata=source["metadata"],
+            )
         hybrid_index.build(chunks, rebuild=rebuild)
         if metadata_store is not None:
             metadata_store.write_index_snapshot(
@@ -238,17 +268,157 @@ def _ingest_from_path(path: Path, rebuild: bool, include_images: bool) -> Ingest
                 parser_version=settings.parser_version,
                 milvus_collection=settings.milvus_collection_name,
             )
+            if job_state is not None:
+                metadata_store.upsert_document_status(
+                    kb_id=settings.kb_id,
+                    doc_id=source["doc_id"],
+                    file_name=source["file_name"],
+                    file_hash=source["file_hash"],
+                    status="indexed",
+                    parser="ingest-request",
+                    parser_version=settings.parser_version,
+                    metadata=source["metadata"],
+                )
+                metadata_store.update_ingest_job(job_state.job_id, status="completed")
         return IngestResponse(
             indexed_chunks=len(chunks),
             source_documents=len(raw_documents),
             scenarios=hybrid_index.scenarios(),
             index_dir=str(settings.resolved_index_dir),
             notices=_ingest_notices(raw_documents),
+            doc_id=source["doc_id"] if metadata_store is not None else None,
+            ingest_job_id=job_state.job_id if job_state is not None else None,
+            ingest_status="completed" if job_state is not None else None,
         )
-    except HTTPException:
+    except HTTPException as exc:
+        if metadata_store is not None and job_state is not None:
+            _mark_ingest_failed(job_state, source, str(exc.detail))
         raise
     except Exception as exc:
+        if metadata_store is not None and job_state is not None:
+            _mark_ingest_failed(job_state, source, _safe_error_message(exc))
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _claim_ingest_job(source: dict[str, object]) -> IngestJobState:
+    assert metadata_store is not None
+    active = metadata_store.get_active_ingest_job(str(source["doc_id"]))
+    if active is not None:
+        return active
+    metadata_store.upsert_document_status(
+        kb_id=settings.kb_id,
+        doc_id=str(source["doc_id"]),
+        file_name=str(source["file_name"]),
+        file_hash=str(source["file_hash"]),
+        status="queued",
+        parser="ingest-request",
+        parser_version=settings.parser_version,
+        metadata=dict(source["metadata"]),
+    )
+    try:
+        job_id = metadata_store.create_ingest_job(
+            kb_id=settings.kb_id,
+            doc_id=str(source["doc_id"]),
+            worker_id=f"worker-{uuid.uuid4().hex[:12]}",
+        )
+    except ActiveIngestJobExists:
+        active = metadata_store.get_active_ingest_job(str(source["doc_id"]))
+        if active is not None:
+            return active
+        raise
+    return IngestJobState(
+        job_id=job_id,
+        doc_id=str(source["doc_id"]),
+        kb_id=settings.kb_id,
+        status="queued",
+        worker_id=None,
+        retry_count=0,
+        error_message=None,
+    )
+
+
+def _active_ingest_response(job_state: IngestJobState) -> IngestResponse:
+    return IngestResponse(
+        indexed_chunks=len(hybrid_index.chunks),
+        source_documents=0,
+        scenarios=hybrid_index.scenarios(),
+        index_dir=str(settings.resolved_index_dir),
+        notices=[],
+        doc_id=job_state.doc_id,
+        ingest_job_id=job_state.job_id,
+        ingest_status=job_state.status,
+    )
+
+
+def _mark_ingest_failed(job_state: IngestJobState, source: dict[str, object], message: str) -> None:
+    assert metadata_store is not None
+    metadata_store.upsert_document_status(
+        kb_id=settings.kb_id,
+        doc_id=str(source["doc_id"]),
+        file_name=str(source["file_name"]),
+        file_hash=str(source["file_hash"]),
+        status="failed",
+        parser="ingest-request",
+        parser_version=settings.parser_version,
+        metadata=dict(source["metadata"]),
+        error_message=message,
+    )
+    metadata_store.fail_ingest_job(job_state.job_id, error_message=message)
+
+
+def _ingest_source(path: Path, *, include_images: bool) -> dict[str, object]:
+    fingerprint = _source_fingerprint(path, include_images=include_images)
+    doc_id = hashlib.sha1(f"{settings.kb_id}:{fingerprint}".encode("utf-8")).hexdigest()[:24]
+    return {
+        "doc_id": doc_id,
+        "file_name": path.name,
+        "file_hash": fingerprint,
+        "metadata": {
+            "source_path": str(path.resolve()),
+            "include_images": include_images,
+            "kind": "ingest_request",
+        },
+    }
+
+
+def _source_fingerprint(path: Path, *, include_images: bool) -> str:
+    digest = hashlib.sha256()
+    if not _is_upload_ingest_path(path):
+        digest.update(str(path.resolve()).encode("utf-8"))
+        digest.update(b"\0")
+    digest.update(str(include_images).encode("utf-8"))
+    digest.update(b"\0")
+    try:
+        files = discover_files(path, include_images=include_images)
+    except OSError:
+        files = []
+    for file_path in files:
+        try:
+            relative = file_path.resolve().relative_to(path.resolve()).as_posix()
+        except ValueError:
+            relative = file_path.name
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            with file_path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+        except OSError:
+            digest.update(str(file_path).encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _is_upload_ingest_path(path: Path) -> bool:
+    try:
+        relative = path.resolve().relative_to((settings.root_dir / ".uploads").resolve())
+        return bool(relative.parts)
+    except ValueError:
+        return False
+
+
+def _safe_error_message(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"[:1000]
 
 
 def _ingest_notices(raw_documents: list[object]) -> list[str]:
