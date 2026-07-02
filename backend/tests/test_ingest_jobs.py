@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.documents import RawDocument
 from app.kb_metadata import ActiveIngestJobExists, IngestJobState
+from app.rebuild_locks import KbRebuildLockBusy
 
 
 class ConcurrentFakeMetadataStore:
@@ -76,6 +77,41 @@ class ConcurrentFakeMetadataStore:
             self.snapshots += 1
 
 
+class NonBlockingFakeRebuildLock:
+    backend = "fake"
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.held = False
+        self.acquired = 0
+        self.busy = 0
+
+    def acquire(self, *, kb_id: str, worker_id: str, timeout_seconds: int):
+        del timeout_seconds
+        return _FakeRebuildLockContext(self, kb_id, worker_id)
+
+
+class _FakeRebuildLockContext:
+    def __init__(self, lock: NonBlockingFakeRebuildLock, kb_id: str, worker_id: str) -> None:
+        self.lock = lock
+        self.kb_id = kb_id
+        self.worker_id = worker_id
+
+    def __enter__(self):
+        with self.lock.lock:
+            if self.lock.held:
+                self.lock.busy += 1
+                raise KbRebuildLockBusy(f"KB rebuild already running for kb_id={self.kb_id}")
+            self.lock.held = True
+            self.lock.acquired += 1
+        return None
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        with self.lock.lock:
+            self.lock.held = False
+        return False
+
+
 def test_concurrent_ingest_path_requests_only_one_enters_parse_and_index(tmp_path, monkeypatch, fake_milvus_client):
     from app import main
     from app.graph import RagService
@@ -134,3 +170,58 @@ def test_concurrent_ingest_path_requests_only_one_enters_parse_and_index(tmp_pat
     assert sum(response["ingest_status"] == "completed" for response in responses) == 1
     active_statuses = {response["ingest_status"] for response in responses if response["ingest_status"] != "completed"}
     assert active_statuses <= {"queued", "parsing", "embedding"}
+
+
+def test_concurrent_rebuild_same_kb_allows_only_one_worker_into_build(tmp_path, monkeypatch, fake_milvus_client):
+    from app import main
+    from app.graph import RagService
+    from app.history import ChatHistoryStore
+    from app.index import HybridIndex
+    from app.providers import HashEmbeddings
+
+    first_docs = tmp_path / "docs-a"
+    second_docs = tmp_path / "docs-b"
+    first_docs.mkdir()
+    second_docs.mkdir()
+    (first_docs / "guide.md").write_text("# Guide\n\nfirst source", encoding="utf-8")
+    (second_docs / "guide.md").write_text("# Guide\n\nsecond source", encoding="utf-8")
+
+    store = ConcurrentFakeMetadataStore()
+    rebuild_lock = NonBlockingFakeRebuildLock()
+    index = HybridIndex(tmp_path / "index", HashEmbeddings(dimensions=32), milvus_client=fake_milvus_client)
+    history = ChatHistoryStore(tmp_path / "sessions.sqlite3")
+    original_build = index.build
+    build_calls = 0
+    build_lock = threading.Lock()
+
+    def slow_build(*args, **kwargs):
+        nonlocal build_calls
+        with build_lock:
+            build_calls += 1
+        time.sleep(0.25)
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(index, "build", slow_build)
+    monkeypatch.setattr(main, "metadata_store", store)
+    monkeypatch.setattr(main, "rebuild_lock", rebuild_lock)
+    monkeypatch.setattr(main, "hybrid_index", index)
+    monkeypatch.setattr(main, "history_store", history)
+    monkeypatch.setattr(main, "rag_service", RagService(main.settings, index, history))
+
+    def post_ingest(path: Path) -> dict[str, object]:
+        with TestClient(main.app) as client:
+            response = client.post(
+                "/api/ingest/path",
+                json={"path": str(path), "rebuild": True, "include_images": False},
+            )
+            assert response.status_code == 200
+            return response.json()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(post_ingest, [first_docs, second_docs]))
+
+    assert build_calls == 1
+    assert store.snapshots == 1
+    assert rebuild_lock.acquired == 1
+    assert rebuild_lock.busy == 1
+    assert {response["ingest_status"] for response in responses} == {"completed", "rebuild_locked"}

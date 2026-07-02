@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +62,8 @@ class PostgresMetadataStore:
 
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
+        self._advisory_lock_connections: dict[int, Any] = {}
+        self._advisory_lock_connections_lock = threading.Lock()
 
     def run_migrations(self) -> None:
         with self._connect() as conn:
@@ -473,6 +476,30 @@ class PostgresMetadataStore:
             milvus_vector_count=milvus_vector_count,
             document_statuses={str(status): int(count) for status, count in status_rows},
         )
+
+    def try_advisory_lock(self, lock_key: int) -> bool:
+        conn = self._connect()
+        try:
+            acquired = bool(conn.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()[0])
+        except Exception:
+            conn.close()
+            raise
+        if not acquired:
+            conn.close()
+            return False
+        with self._advisory_lock_connections_lock:
+            self._advisory_lock_connections[lock_key] = conn
+        return True
+
+    def release_advisory_lock(self, lock_key: int) -> None:
+        with self._advisory_lock_connections_lock:
+            conn = self._advisory_lock_connections.pop(lock_key, None)
+        if conn is None:
+            return
+        try:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+        finally:
+            conn.close()
 
     def _connect(self) -> Any:
         try:

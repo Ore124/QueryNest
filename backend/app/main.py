@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import shutil
 import threading
 import uuid
@@ -20,6 +22,7 @@ from .kb_metadata import ActiveIngestJobExists, IngestJobState, PostgresMetadata
 from .mineru_api_client import MineruApiClient, MineruApiClientConfig
 from .pdf_parse_router import PdfParseRouter, PdfParseRouterConfig
 from .providers import CachedEmbeddings, get_embeddings
+from .rebuild_locks import KbRebuildLockBusy, PostgresAdvisoryKbRebuildLock, RedisKbRebuildLock
 from .reranker import create_reranker
 from .schemas import (
     ChatRequest,
@@ -34,6 +37,7 @@ from .schemas import (
 from .settings import Settings, get_settings
 
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 cache_store = (
     RedisJsonCache(
@@ -47,6 +51,13 @@ cache_store = (
 metadata_store = PostgresMetadataStore(settings.postgres_dsn) if settings.postgres_dsn else None
 if metadata_store is not None:
     metadata_store.run_migrations()
+rebuild_lock = (
+    RedisKbRebuildLock(cache_store.client)
+    if isinstance(cache_store, RedisJsonCache)
+    else PostgresAdvisoryKbRebuildLock(metadata_store)
+    if metadata_store is not None
+    else None
+)
 base_embeddings = get_embeddings(settings)
 embeddings = (
     CachedEmbeddings(
@@ -256,30 +267,45 @@ def _ingest_from_path(path: Path, rebuild: bool, include_images: bool) -> Ingest
                 parser_version=settings.parser_version,
                 metadata=source["metadata"],
             )
-        hybrid_index.build(chunks, rebuild=rebuild)
-        if metadata_store is not None:
-            metadata_store.write_index_snapshot(
-                kb_id=settings.kb_id,
-                index_version=hybrid_index.index_revision,
-                raw_documents=raw_documents,
-                chunks=chunks,
-                embedding_model=settings.resolved_embedding_model,
-                chunker_version=settings.chunker_version,
-                parser_version=settings.parser_version,
-                milvus_collection=settings.milvus_collection_name,
+        try:
+            with _rebuild_lock_context(settings.kb_id, job_state):
+                hybrid_index.build(chunks, rebuild=rebuild)
+                if metadata_store is not None:
+                    metadata_store.write_index_snapshot(
+                        kb_id=settings.kb_id,
+                        index_version=hybrid_index.index_revision,
+                        raw_documents=raw_documents,
+                        chunks=chunks,
+                        embedding_model=settings.resolved_embedding_model,
+                        chunker_version=settings.chunker_version,
+                        parser_version=settings.parser_version,
+                        milvus_collection=settings.milvus_collection_name,
+                    )
+                    if job_state is not None:
+                        metadata_store.upsert_document_status(
+                            kb_id=settings.kb_id,
+                            doc_id=source["doc_id"],
+                            file_name=source["file_name"],
+                            file_hash=source["file_hash"],
+                            status="indexed",
+                            parser="ingest-request",
+                            parser_version=settings.parser_version,
+                            metadata=source["metadata"],
+                        )
+                        metadata_store.update_ingest_job(job_state.job_id, status="completed")
+        except KbRebuildLockBusy as exc:
+            if metadata_store is not None and job_state is not None:
+                _mark_ingest_failed(job_state, source, _safe_error_message(exc))
+            return IngestResponse(
+                indexed_chunks=len(hybrid_index.chunks),
+                source_documents=0,
+                scenarios=hybrid_index.scenarios(),
+                index_dir=str(settings.resolved_index_dir),
+                notices=[],
+                doc_id=source["doc_id"] if metadata_store is not None else None,
+                ingest_job_id=job_state.job_id if job_state is not None else None,
+                ingest_status="rebuild_locked",
             )
-            if job_state is not None:
-                metadata_store.upsert_document_status(
-                    kb_id=settings.kb_id,
-                    doc_id=source["doc_id"],
-                    file_name=source["file_name"],
-                    file_hash=source["file_hash"],
-                    status="indexed",
-                    parser="ingest-request",
-                    parser_version=settings.parser_version,
-                    metadata=source["metadata"],
-                )
-                metadata_store.update_ingest_job(job_state.job_id, status="completed")
         return IngestResponse(
             indexed_chunks=len(chunks),
             source_documents=len(raw_documents),
@@ -315,11 +341,12 @@ def _claim_ingest_job(source: dict[str, object]) -> IngestJobState:
         parser_version=settings.parser_version,
         metadata=dict(source["metadata"]),
     )
+    worker_id = _worker_id()
     try:
         job_id = metadata_store.create_ingest_job(
             kb_id=settings.kb_id,
             doc_id=str(source["doc_id"]),
-            worker_id=f"worker-{uuid.uuid4().hex[:12]}",
+            worker_id=worker_id,
         )
     except ActiveIngestJobExists:
         active = metadata_store.get_active_ingest_job(str(source["doc_id"]))
@@ -331,10 +358,90 @@ def _claim_ingest_job(source: dict[str, object]) -> IngestJobState:
         doc_id=str(source["doc_id"]),
         kb_id=settings.kb_id,
         status="queued",
-        worker_id=None,
+        worker_id=worker_id,
         retry_count=0,
         error_message=None,
     )
+
+
+def _rebuild_lock_context(kb_id: str, job_state: IngestJobState | None):
+    worker_id = job_state.worker_id if job_state and job_state.worker_id else _worker_id()
+    if rebuild_lock is None:
+        logger.info(
+            "KB rebuild lock unavailable kb_id=%s worker_id=%s pid=%s index_version=%s status=disabled",
+            kb_id,
+            worker_id,
+            os.getpid(),
+            hybrid_index.index_revision,
+        )
+        return _NullRebuildLockContext()
+    logger.info(
+        "KB rebuild lock acquire kb_id=%s worker_id=%s pid=%s index_version=%s status=waiting backend=%s",
+        kb_id,
+        worker_id,
+        os.getpid(),
+        hybrid_index.index_revision,
+        getattr(rebuild_lock, "backend", "unknown"),
+    )
+    return _LoggingRebuildLockContext(
+        inner=rebuild_lock.acquire(kb_id=kb_id, worker_id=worker_id, timeout_seconds=900),
+        kb_id=kb_id,
+        worker_id=worker_id,
+    )
+
+
+class _NullRebuildLockContext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        return False
+
+
+class _LoggingRebuildLockContext:
+    def __init__(self, *, inner, kb_id: str, worker_id: str) -> None:
+        self.inner = inner
+        self.kb_id = kb_id
+        self.worker_id = worker_id
+
+    def __enter__(self):
+        try:
+            self.inner.__enter__()
+        except KbRebuildLockBusy:
+            logger.info(
+                "KB rebuild lock busy kb_id=%s worker_id=%s pid=%s index_version=%s status=busy",
+                self.kb_id,
+                self.worker_id,
+                os.getpid(),
+                hybrid_index.index_revision,
+            )
+            raise
+        logger.info(
+            "KB rebuild lock acquired kb_id=%s worker_id=%s pid=%s index_version=%s status=acquired",
+            self.kb_id,
+            self.worker_id,
+            os.getpid(),
+            hybrid_index.index_revision,
+        )
+        return None
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        try:
+            return bool(self.inner.__exit__(exc_type, exc, traceback))
+        finally:
+            status = "released" if exc is None else "released_after_error"
+            logger.info(
+                "KB rebuild lock release kb_id=%s worker_id=%s pid=%s index_version=%s status=%s",
+                self.kb_id,
+                self.worker_id,
+                os.getpid(),
+                hybrid_index.index_revision,
+                status,
+            )
+
+
+def _worker_id() -> str:
+    return f"worker-{uuid.uuid4().hex[:12]}"
 
 
 def _active_ingest_response(job_state: IngestJobState) -> IngestResponse:
