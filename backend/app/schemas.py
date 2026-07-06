@@ -30,6 +30,39 @@ class Source(BaseModel):
     rerank_score: float | None = None
 
 
+class ChunkView(BaseModel):
+    chunk_id: str
+    text: str
+    source_path: str
+    source_name: str
+    file_type: str
+    scenario: str
+    section: str | None = None
+    page: int | None = None
+    content_type: str = "text"
+    chunk_index: int | None = None
+
+
+class ChunkListResponse(BaseModel):
+    chunks: list[ChunkView]
+    total: int
+    offset: int
+    limit: int
+
+
+class DocumentView(BaseModel):
+    source_path: str
+    source_name: str
+    file_type: str
+    scenario: str
+    chunk_count: int
+
+
+class DocumentListResponse(BaseModel):
+    documents: list[DocumentView]
+    total: int
+
+
 class IngestPathRequest(BaseModel):
     path: Path
     rebuild: bool = True
@@ -53,6 +86,7 @@ class ChatRequest(BaseModel):
     scenario: str | None = None
     model: str | None = None
     top_k: int | None = Field(default=None, ge=1, le=20)
+    agentic: bool = False
 
 
 class ChatResponse(BaseModel):

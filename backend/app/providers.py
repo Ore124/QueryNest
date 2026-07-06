@@ -43,7 +43,7 @@ class CachedEmbeddings(Embeddings):
         *,
         cache: JsonCache,
         model: str,
-        dimensions: int,
+        dimensions: int | None,
         ttl_seconds: int,
     ) -> None:
         self.inner = inner
@@ -74,14 +74,18 @@ class CachedEmbeddings(Embeddings):
 
 
 def get_embeddings(settings: Settings, *, offline: bool = False) -> Embeddings:
-    if offline or not settings.zai_api_key:
-        return HashEmbeddings(dimensions=min(settings.embedding_dimensions, 256))
+    if offline or not settings.resolved_embedding_api_key:
+        dimensions = settings.resolved_embedding_dimensions or 128
+        return HashEmbeddings(dimensions=min(dimensions, 256))
+    provider = settings.resolved_embedding_provider
+    if provider not in {"zhipu", "bailian", "openai"}:
+        raise ValueError(f"Unsupported embedding provider: {provider}")
     return OpenAIEmbeddings(
-        model=settings.default_embedding_model,
-        dimensions=settings.embedding_dimensions,
-        api_key=settings.zai_api_key,
-        base_url=settings.zai_api_base,
-        chunk_size=64,
+        model=settings.resolved_embedding_model,
+        dimensions=settings.resolved_embedding_dimensions,
+        api_key=settings.resolved_embedding_api_key,
+        base_url=settings.resolved_embedding_base_url,
+        chunk_size=settings.resolved_embedding_batch_size,
         check_embedding_ctx_length=False,
     )
 
@@ -96,8 +100,8 @@ def get_chat_model(
     thinking: bool | None = None,
     max_tokens: int | None = None,
 ) -> BaseChatModel:
-    if not settings.zai_api_key:
-        raise RuntimeError("ZAI_API_KEY is required for model calls.")
+    if not settings.resolved_llm_api_key:
+        raise RuntimeError("LLM_API_KEY is required for model calls.")
     options: dict[str, object] = {}
     if thinking is not None:
         options["extra_body"] = {
@@ -106,9 +110,9 @@ def get_chat_model(
     if max_tokens is not None:
         options["max_tokens"] = max_tokens
     return ChatOpenAI(
-        model=model or settings.default_chat_model,
-        api_key=settings.zai_api_key,
-        base_url=settings.zai_api_base,
+        model=model or settings.resolved_llm_model,
+        api_key=settings.resolved_llm_api_key,
+        base_url=settings.resolved_llm_base_url,
         temperature=temperature,
         timeout=timeout,
         max_retries=max_retries,

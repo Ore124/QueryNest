@@ -26,8 +26,43 @@ export type ChatResponse = {
   session_id: string;
   answer: string;
   sources: Source[];
-  retrieval_debug: Record<string, unknown>;
+  retrieval_debug: RetrievalDebug;
 };
+
+export type ChunkItem = {
+  chunk_id: string;
+  text: string;
+  source_path: string;
+  source_name: string;
+  file_type: string;
+  scenario: string;
+  section?: string | null;
+  page?: number | null;
+  content_type: string;
+  chunk_index?: number | null;
+};
+
+export type ChunkListResponse = {
+  chunks: ChunkItem[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+export type DocumentItem = {
+  source_path: string;
+  source_name: string;
+  file_type: string;
+  scenario: string;
+  chunk_count: number;
+};
+
+export type DocumentListResponse = {
+  documents: DocumentItem[];
+  total: number;
+};
+
+export type RetrievalDebug = Record<string, unknown>;
 
 export type Health = {
   status: string;
@@ -54,4 +89,5 @@ export type Message = {
   role: "user" | "assistant";
   content: string;
   sources?: Source[];
+  retrieval_debug?: RetrievalDebug;
 };

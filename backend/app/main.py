@@ -8,7 +8,9 @@ import threading
 import uuid
 from pathlib import Path, PurePosixPath
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from typing import Any
+
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from .cache import NullJsonCache, RedisJsonCache
@@ -27,6 +29,10 @@ from .reranker import create_reranker
 from .schemas import (
     ChatRequest,
     ChatResponse,
+    ChunkListResponse,
+    ChunkView,
+    DocumentListResponse,
+    DocumentView,
     HealthResponse,
     IngestPathRequest,
     IngestResponse,
@@ -107,7 +113,7 @@ document_parsers = DocumentParserRouter(
 embedding_warmed = False
 embedding_warmup_lock = threading.Lock()
 
-app = FastAPI(title="RAG Knowledge Assistant", version="0.1.0")
+app = FastAPI(title="QueryNest", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin, "http://127.0.0.1:5173", "http://localhost:5173"],
@@ -137,6 +143,71 @@ def health() -> HealthResponse:
 @app.get("/api/scenarios", response_model=ScenarioResponse)
 def scenarios() -> ScenarioResponse:
     return ScenarioResponse(scenarios=hybrid_index.scenarios())
+
+
+@app.get("/api/documents", response_model=DocumentListResponse)
+def documents(scenario: str | None = None) -> DocumentListResponse:
+    rows = [
+        chunk
+        for chunk in hybrid_index.chunks
+        if not scenario or str(chunk.get("metadata", {}).get("scenario", "")) == scenario
+    ]
+    documents_by_path: dict[str, dict[str, Any]] = {}
+    for chunk in rows:
+        metadata = dict(chunk.get("metadata", {}))
+        source_path = str(metadata.get("source_path") or "")
+        key = source_path or str(metadata.get("source_name") or "")
+        if not key:
+            key = str(chunk.get("chunk_id", ""))
+        record = documents_by_path.setdefault(
+            key,
+            {
+                "source_path": source_path,
+                "source_name": str(metadata.get("source_name") or key),
+                "file_type": str(metadata.get("file_type") or ""),
+                "scenario": str(metadata.get("scenario") or ""),
+                "chunk_count": 0,
+            },
+        )
+        record["chunk_count"] = int(record["chunk_count"]) + 1
+    views = [
+        DocumentView(**record)
+        for record in sorted(
+            documents_by_path.values(),
+            key=lambda item: (str(item["source_name"]).lower(), str(item["source_path"]).lower()),
+        )
+    ]
+    return DocumentListResponse(documents=views, total=len(views))
+
+
+@app.get("/api/chunks", response_model=ChunkListResponse)
+def chunks(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    scenario: str | None = None,
+    source_path: str | None = None,
+) -> ChunkListResponse:
+    rows = [
+        chunk
+        for chunk in hybrid_index.chunks
+        if (not scenario or str(chunk.get("metadata", {}).get("scenario", "")) == scenario)
+        and (not source_path or str(chunk.get("metadata", {}).get("source_path", "")) == source_path)
+    ]
+    ordered = sorted(
+        rows,
+        key=lambda chunk: (
+            str(chunk.get("metadata", {}).get("source_name", "")),
+            _int_or_none(chunk.get("metadata", {}).get("chunk_index")) or 0,
+            str(chunk.get("chunk_id", "")),
+        ),
+    )
+    page = ordered[offset : offset + limit]
+    return ChunkListResponse(
+        chunks=[_to_chunk_view(chunk) for chunk in page],
+        total=len(ordered),
+        offset=offset,
+        limit=limit,
+    )
 
 
 @app.get("/api/models", response_model=list[ModelInfo])
@@ -192,12 +263,25 @@ async def ingest_files(
 ) -> IngestResponse:
     upload_dir = settings.root_dir / ".uploads" / str(uuid.uuid4())
     upload_dir.mkdir(parents=True, exist_ok=True)
+    mime_types: dict[str, str] = {}
+    upload_filenames: list[str] = []
     for uploaded in files:
         target = _safe_upload_target(upload_dir, uploaded.filename)
+        upload_filenames.append(uploaded.filename or "")
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("wb") as stream:
             shutil.copyfileobj(uploaded.file, stream)
-    return _ingest_from_path(upload_dir, rebuild=True, include_images=include_images)
+        if uploaded.content_type:
+            mime_types[str(target.resolve())] = uploaded.content_type
+    ingest_root = _uploaded_ingest_root(upload_dir, upload_filenames)
+    logger.info(
+        "Ingest upload received files=%s upload_dir=%s ingest_root=%s include_images=%s",
+        len(upload_filenames),
+        upload_dir,
+        ingest_root,
+        include_images,
+    )
+    return _ingest_from_path(ingest_root, rebuild=True, include_images=include_images, mime_types=mime_types)
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -211,6 +295,7 @@ def chat(request: ChatRequest) -> ChatResponse:
             scenario=request.scenario,
             model=request.model,
             top_k=request.top_k,
+            agentic=request.agentic,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -228,9 +313,54 @@ def _safe_upload_target(upload_dir: Path, filename: str | None) -> Path:
     return upload_dir.joinpath(*parts)
 
 
-def _ingest_from_path(path: Path, rebuild: bool, include_images: bool) -> IngestResponse:
+def _uploaded_ingest_root(upload_dir: Path, filenames: list[str]) -> Path:
+    relative_parts = [
+        PurePosixPath((filename or "").replace("\\", "/")).parts
+        for filename in filenames
+    ]
+    if not relative_parts or any(len(parts) < 2 for parts in relative_parts):
+        return upload_dir
+    first_parts = {parts[0] for parts in relative_parts}
+    if len(first_parts) != 1:
+        return upload_dir
+    if not any(len(parts) > 2 for parts in relative_parts):
+        return upload_dir
+    return upload_dir / next(iter(first_parts))
+
+
+def _to_chunk_view(chunk: dict[str, Any]) -> ChunkView:
+    metadata = dict(chunk.get("metadata", {}))
+    return ChunkView(
+        chunk_id=str(chunk.get("chunk_id", "")),
+        text=str(chunk.get("text", "")),
+        source_path=str(metadata.get("source_path", "")),
+        source_name=str(metadata.get("source_name", "")),
+        file_type=str(metadata.get("file_type", "")),
+        scenario=str(metadata.get("scenario", "")),
+        section=metadata.get("section"),
+        page=_int_or_none(metadata.get("page")),
+        content_type=str(metadata.get("content_type", "text")),
+        chunk_index=_int_or_none(metadata.get("chunk_index")),
+    )
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ingest_from_path(
+    path: Path,
+    rebuild: bool,
+    include_images: bool,
+    mime_types: dict[str, str] | None = None,
+) -> IngestResponse:
     job_state: IngestJobState | None = None
-    source = _ingest_source(path, include_images=include_images)
+    source = _ingest_source(path, include_images=include_images, mime_types=mime_types)
     try:
         job_state = _claim_ingest_job(source)
         if job_state.status != "queued":
@@ -246,8 +376,20 @@ def _ingest_from_path(path: Path, rebuild: bool, include_images: bool) -> Ingest
             parser_version=settings.parser_version,
             metadata=source["metadata"],
         )
-        raw_documents = load_documents(path, document_parsers, include_images=include_images)
+        raw_documents = (
+            load_documents(path, document_parsers, include_images=include_images, mime_types=mime_types)
+            if mime_types is not None
+            else load_documents(path, document_parsers, include_images=include_images)
+        )
         chunks = split_documents(raw_documents, settings.chunk_size, settings.chunk_overlap)
+        logger.info(
+            "Ingest parsed path=%s doc_id=%s raw_documents=%s chunks=%s include_images=%s",
+            path,
+            source["doc_id"],
+            len(raw_documents),
+            len(chunks),
+            include_images,
+        )
         if not chunks:
             raise HTTPException(status_code=400, detail="No supported documents found.")
         metadata_store.update_ingest_job(job_state.job_id, status="embedding")
@@ -289,6 +431,14 @@ def _ingest_from_path(path: Path, rebuild: bool, include_images: bool) -> Ingest
                     metadata=source["metadata"],
                 )
                 metadata_store.update_ingest_job(job_state.job_id, status="completed")
+                logger.info(
+                    "Ingest completed path=%s doc_id=%s index_version=%s chunks=%s scenarios=%s",
+                    path,
+                    source["doc_id"],
+                    hybrid_index.index_revision,
+                    len(chunks),
+                    hybrid_index.scenarios(),
+                )
         except KbRebuildLockBusy as exc:
             _mark_ingest_failed(job_state, source, _safe_error_message(exc))
             return IngestResponse(
@@ -466,8 +616,8 @@ def _mark_ingest_failed(job_state: IngestJobState, source: dict[str, object], me
     metadata_store.fail_ingest_job(job_state.job_id, error_message=message)
 
 
-def _ingest_source(path: Path, *, include_images: bool) -> dict[str, object]:
-    fingerprint = _source_fingerprint(path, include_images=include_images)
+def _ingest_source(path: Path, *, include_images: bool, mime_types: dict[str, str] | None = None) -> dict[str, object]:
+    fingerprint = _source_fingerprint(path, include_images=include_images, mime_types=mime_types)
     doc_id = hashlib.sha1(f"{settings.kb_id}:{fingerprint}".encode("utf-8")).hexdigest()[:24]
     return {
         "doc_id": doc_id,
@@ -481,7 +631,7 @@ def _ingest_source(path: Path, *, include_images: bool) -> dict[str, object]:
     }
 
 
-def _source_fingerprint(path: Path, *, include_images: bool) -> str:
+def _source_fingerprint(path: Path, *, include_images: bool, mime_types: dict[str, str] | None = None) -> str:
     digest = hashlib.sha256()
     if not _is_upload_ingest_path(path):
         digest.update(str(path.resolve()).encode("utf-8"))
@@ -489,7 +639,7 @@ def _source_fingerprint(path: Path, *, include_images: bool) -> str:
     digest.update(str(include_images).encode("utf-8"))
     digest.update(b"\0")
     try:
-        files = discover_files(path, include_images=include_images)
+        files = discover_files(path, include_images=include_images, mime_types=mime_types)
     except OSError:
         files = []
     for file_path in files:
