@@ -78,7 +78,6 @@ class Settings(BaseSettings):
     kb_id: str = Field(default="default", alias="KB_ID")
     parser_version: str = Field(default="document-parsers-v1", alias="PARSER_VERSION")
     chunker_version: str = Field(default="recursive-character-v1", alias="CHUNKER_VERSION")
-    sqlite_path: Path = Field(default=Path(".sessions/rag_chat.sqlite3"), alias="SQLITE_PATH")
     default_source_path: Path = Field(default=Path(r"D:\Codex Projects\knowledge"), alias="DEFAULT_SOURCE_PATH")
     frontend_origin: str = Field(default="http://localhost:5173", alias="FRONTEND_ORIGIN")
     run_real_api_tests: bool = Field(default=False, alias="RUN_REAL_API_TESTS")
@@ -97,6 +96,16 @@ class Settings(BaseSettings):
         default="根据用户问题，判断候选知识库片段对回答问题的相关性，并优先返回直接包含答案依据的片段。",
         alias="RERANK_INSTRUCT",
     )
+    adaptive_context_enabled: bool = Field(default=True, alias="ADAPTIVE_CONTEXT_ENABLED")
+    adaptive_context_min_sources: int = Field(
+        default=2, ge=1, le=20, alias="ADAPTIVE_CONTEXT_MIN_SOURCES"
+    )
+    adaptive_context_score_ratio: float = Field(
+        default=0.5, gt=0.0, le=1.0, alias="ADAPTIVE_CONTEXT_SCORE_RATIO"
+    )
+    adaptive_context_max_chars: int = Field(
+        default=7200, ge=1, alias="ADAPTIVE_CONTEXT_MAX_CHARS"
+    )
     mineru_api_base: str = Field(default="https://mineru.net/api/v4", alias="MINERU_API_BASE")
     mineru_api_token: str = Field(default="", alias="MINERU_API_TOKEN")
     mineru_api_poll_interval_seconds: float = Field(default=3.0, alias="MINERU_API_POLL_INTERVAL_SECONDS")
@@ -113,9 +122,23 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="", alias="REDIS_URL")
     redis_key_prefix: str = Field(default="rag:chat", alias="REDIS_KEY_PREFIX")
     redis_session_ttl_seconds: int = Field(default=604800, alias="REDIS_SESSION_TTL_SECONDS")
-    redis_history_max_messages: int = Field(default=100, alias="REDIS_HISTORY_MAX_MESSAGES")
+    history_cache_max_messages: int = Field(
+        default=100,
+        validation_alias=AliasChoices("HISTORY_CACHE_MAX_MESSAGES", "REDIS_HISTORY_MAX_MESSAGES"),
+    )
     redis_cache_key_prefix: str = Field(default="rag:cache", alias="REDIS_CACHE_KEY_PREFIX")
     redis_cache_ttl_seconds: int = Field(default=86400, alias="REDIS_CACHE_TTL_SECONDS")
+    # Optional deployment override.  When absent, startup obtains a durable
+    # server-only secret from PostgreSQL after migrations have run.
+    auth_jwt_secret: str = Field(default="", alias="AUTH_JWT_SECRET", validate_default=True)
+    auth_jwt_issuer: str = Field(default="rag-knowledge-assistant", alias="AUTH_JWT_ISSUER")
+    auth_jwt_expiry_minutes: int = Field(default=60, alias="AUTH_JWT_EXPIRY_MINUTES")
+    auth_bootstrap_admin_username: str = Field(default="admin", alias="AUTH_BOOTSTRAP_ADMIN_USERNAME")
+    auth_bootstrap_admin_password: str = Field(default="12345", alias="AUTH_BOOTSTRAP_ADMIN_PASSWORD")
+    personal_memory_enabled: bool = Field(default=True, alias="PERSONAL_MEMORY_ENABLED")
+    personal_memory_retrieval_max_items: int = Field(default=5, alias="PERSONAL_MEMORY_RETRIEVAL_MAX_ITEMS")
+    personal_memory_default_ttl_days: int = Field(default=90, alias="PERSONAL_MEMORY_DEFAULT_TTL_DAYS")
+    personal_memory_extraction_max_items: int = Field(default=5, alias="PERSONAL_MEMORY_EXTRACTION_MAX_ITEMS")
 
     dense_top_k: int = 20
     bm25_top_k: int = 20
@@ -139,6 +162,40 @@ class Settings(BaseSettings):
             raise ValueError("POSTGRES_DSN is required. PostgreSQL is the knowledge-base metadata store.")
         return dsn
 
+    @field_validator("auth_jwt_secret")
+    @classmethod
+    def _validate_configured_auth_jwt_secret(cls, value: str) -> str:
+        secret = value.strip()
+        if not secret:
+            return ""
+        insecure_values = {"change-me", "replace-with-a-secure-secret", "your-secret-here"}
+        if secret.lower() in insecure_values:
+            raise ValueError("AUTH_JWT_SECRET must not use a default placeholder.")
+        if len(secret) < 32:
+            raise ValueError("AUTH_JWT_SECRET must be at least 32 characters long.")
+        return secret
+
+    @field_validator("auth_jwt_expiry_minutes")
+    @classmethod
+    def _require_positive_auth_expiry(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("AUTH_JWT_EXPIRY_MINUTES must be greater than zero.")
+        return value
+
+    @field_validator("personal_memory_retrieval_max_items", "personal_memory_extraction_max_items")
+    @classmethod
+    def _bound_personal_memory_items(cls, value: int) -> int:
+        if not 1 <= value <= 5:
+            raise ValueError("Personal-memory item limits must be between 1 and 5.")
+        return value
+
+    @field_validator("personal_memory_default_ttl_days")
+    @classmethod
+    def _bound_personal_memory_ttl(cls, value: int) -> int:
+        if not 1 <= value <= 365:
+            raise ValueError("PERSONAL_MEMORY_DEFAULT_TTL_DAYS must be between 1 and 365.")
+        return value
+
     @property
     def root_dir(self) -> Path:
         return _project_root()
@@ -146,10 +203,6 @@ class Settings(BaseSettings):
     @property
     def resolved_artifact_dir(self) -> Path:
         return self.artifact_dir if self.artifact_dir.is_absolute() else self.root_dir / self.artifact_dir
-
-    @property
-    def resolved_sqlite_path(self) -> Path:
-        return self.sqlite_path if self.sqlite_path.is_absolute() else self.root_dir / self.sqlite_path
 
     @property
     def resolved_llm_provider(self) -> str:

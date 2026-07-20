@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import re
@@ -10,6 +11,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
+
+from .ingestion_cleaning import clean_extracted_text
 
 
 logger = logging.getLogger(__name__)
@@ -89,7 +92,7 @@ class DocumentParserRouter:
             return _result_from_blocks(path, file_type, block.parser, [block], {"mime_type": mime_type})
         if file_type == "pdf":
             result = self.pdf_router.parse_pdf(path)
-            content = str(result.get("content", "")).strip()
+            content = clean_extracted_text(str(result.get("content", "")), file_type="pdf")
             notice = _pdf_parse_notice(path, result)
             parser = str(result.get("parser", "pymupdf"))
             metadata = result.get("metadata")
@@ -133,17 +136,21 @@ def text_file_to_parse_result(path: Path, *, file_type: str | None = None, mime_
     parser = "markdown" if file_type == "md" else "text"
     text = read_text(path)
     cache_key = parser_cache_key(path, parser)
-    blocks = [
-        ParsedBlock(
-            text=block_text,
-            content_type="text",
-            parser=parser,
-            section=section or extract_first_heading(block_text),
-            cache_key=cache_key,
-            parser_metadata={"mime_type": mime_type, "encoding": "auto"},
+    blocks: list[ParsedBlock] = []
+    for block_text, section in split_markdown_heading_blocks(text):
+        clean_text = clean_extracted_text(block_text, file_type=file_type)
+        if not clean_text:
+            continue
+        blocks.append(
+            ParsedBlock(
+                text=clean_text,
+                content_type="text",
+                parser=parser,
+                section=section or extract_first_heading(clean_text),
+                cache_key=cache_key,
+                parser_metadata={"mime_type": mime_type, "encoding": "auto"},
+            )
         )
-        for block_text, section in split_markdown_heading_blocks(text)
-    ]
     logger.info(
         "Document parse file_name=%s file_type=%s parser=%s blocks=%d cache_key=%s",
         path.name,
@@ -476,8 +483,8 @@ def table_structure_to_markdown(structure: dict[str, Any]) -> str:
 def delimited_table_to_block(path: Path, delimiter: str) -> ParsedBlock:
     import csv
 
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
-        rows = [[cell.strip() for cell in row] for row in csv.reader(stream, delimiter=delimiter)]
+    text = read_text(path)
+    rows = [[cell.strip() for cell in row] for row in csv.reader(io.StringIO(text), delimiter=delimiter)]
     rows = [row for row in rows if any(row)]
     headers = rows[0] if rows else []
     body = rows[1:] if len(rows) > 1 else []

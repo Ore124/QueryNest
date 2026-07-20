@@ -85,6 +85,61 @@ export type ModelInfo = {
   available: boolean;
 };
 
+export type TokenResponse = {
+  access_token: string;
+  token_type: string;
+};
+
+export type CreatedUser = {
+  user_id: string;
+  username: string;
+  role: "personal";
+};
+
+export type AdminUser = {
+  user_id: string;
+  username: string;
+  role: "admin" | "personal";
+};
+
+export type AdminConversation = {
+  session_id: string;
+  title?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  message_count?: number;
+};
+
+export type AdminConversationMessage = {
+  role: "user" | "assistant";
+  content: string;
+  created_at?: string | null;
+};
+
+export type Conversation = {
+  session_id: string;
+  title?: string | null;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+};
+
+export type ConversationMessage = {
+  role: "user" | "assistant";
+  content: string;
+  created_at: string;
+};
+
+export type PersonalMemory = {
+  memory_id: string;
+  memory_type: "preference" | "profile" | "fact";
+  key: string;
+  value: string;
+  confidence: number;
+  source_session_id?: string | null;
+  expires_at?: string | null;
+};
+
 export type Message = {
   role: "user" | "assistant";
   content: string;
