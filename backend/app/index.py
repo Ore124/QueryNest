@@ -101,6 +101,17 @@ class HybridIndex:
         for row in chunk_rows:
             row["metadata"]["kb_id"] = self.kb_id
             row["metadata"]["index_version"] = index_version
+        if not chunk_rows:
+            client = self._client()
+            if self._collection_exists():
+                client.drop_collection(collection_name=self.milvus_collection_name)
+            self.chunks = []
+            self.chunk_by_id = {}
+            self.index_revision = index_version
+            self.dense_ready = False
+            self.origin = "postgresql_milvus"
+            self.build_count += 1
+            return
         self._build_hybrid_collection(chunk_rows, index_version)
         self.chunks = chunk_rows
         self.chunk_by_id = {chunk["chunk_id"]: chunk for chunk in self.chunks}
@@ -137,6 +148,7 @@ class HybridIndex:
         bm25_top_k: int,
         final_top_k: int,
         rrf_k: int,
+        apply_rerank: bool = True,
     ) -> tuple[list[Source], dict[str, Any]]:
         if not self.ready:
             raise RuntimeError("Index is not ready. Run ingestion first.")
@@ -147,6 +159,7 @@ class HybridIndex:
             bm25_top_k=bm25_top_k,
             final_top_k=final_top_k,
             rrf_k=rrf_k,
+            apply_rerank=apply_rerank,
         )
         cached = self.cache.get_json("retrieval", cache_payload) if self.cache else None
         if isinstance(cached, dict):
@@ -199,7 +212,9 @@ class HybridIndex:
 
         candidates = fused[:candidate_count]
         started = time.perf_counter()
-        top_hits, rerank_error = self._rerank(query, candidates, final_top_k)
+        top_hits, rerank_error = (
+            self._rerank(query, candidates, final_top_k) if apply_rerank else (candidates[:final_top_k], None)
+        )
         rerank_ms = (time.perf_counter() - started) * 1000
         sources = [self._to_source(hit) for hit in top_hits]
         debug = {
@@ -214,7 +229,7 @@ class HybridIndex:
             "fused_hits": [hit.chunk_id for hit in candidates],
             "retrieval_backend": "milvus_hybrid",
             "rerank_model": self.reranker.model if self.reranker else None,
-            "rerank_applied": self.reranker is not None and rerank_error is None,
+            "rerank_applied": apply_rerank and self.reranker is not None and rerank_error is None,
             "rerank_error": rerank_error,
             "reranked_hits": [hit.chunk_id for hit in top_hits],
             "index_operation": "search_only",
@@ -573,6 +588,26 @@ class HybridIndex:
         except Exception as exc:
             return candidates[:final_top_k], f"{type(exc).__name__}: {exc}"
 
+    def rerank_sources(
+        self,
+        query: str,
+        candidates: list[Source],
+        final_top_k: int,
+    ) -> tuple[list[Source], str | None]:
+        """Rerank a cross-query candidate union without another vector search."""
+        if self.reranker is None:
+            return candidates[:final_top_k], None
+        try:
+            results = self.reranker.rerank(query, [source.text for source in candidates], top_n=final_top_k)
+            reranked = [
+                candidates[result.index].model_copy(update={"rerank_rank": rank, "rerank_score": result.score})
+                for rank, result in enumerate(results, start=1)
+                if 0 <= result.index < len(candidates)
+            ]
+            return reranked[:final_top_k], None
+        except Exception as exc:
+            return candidates[:final_top_k], f"{type(exc).__name__}: {exc}"
+
     def _retrieval_cache_payload(
         self,
         *,
@@ -582,6 +617,7 @@ class HybridIndex:
         bm25_top_k: int,
         final_top_k: int,
         rrf_k: int,
+        apply_rerank: bool = True,
     ) -> dict[str, Any]:
         return {
             "query": query,
@@ -590,6 +626,7 @@ class HybridIndex:
             "bm25_top_k": bm25_top_k,
             "final_top_k": final_top_k,
             "rrf_k": rrf_k,
+            "apply_rerank": apply_rerank,
             "retrieval_backend": "milvus_hybrid",
             "reranker_model": self.reranker.model if self.reranker else None,
             "rerank_candidate_top_k": self.rerank_candidate_top_k,

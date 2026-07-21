@@ -8,8 +8,9 @@ import random
 import sys
 import time
 import types
+from collections import Counter
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from datasets import Dataset
 
@@ -17,21 +18,24 @@ from .documents import read_text
 from .settings import get_settings
 
 
-def parse_question_set(path: Path) -> list[dict[str, str]]:
+MAX_RECALL_OR_MRR_DROP = 0.01
+MAX_LLM_CALL_RATE = 0.30
+MAX_P95_LATENCY_INCREASE_MS = 1_500
+
+
+def parse_question_set(path: Path) -> list[dict[str, Any]]:
     if path.suffix.lower() == ".csv":
         with path.open("r", encoding="utf-8-sig", newline="") as stream:
-            return [
-                {key: str(value or "").strip() for key, value in row.items()}
-                for row in csv.DictReader(stream)
-            ]
-    rows: list[dict[str, str]] = []
-    for line in read_text(path).splitlines():
+            return [_normalize_question_row(row) for row in csv.DictReader(stream)]
+    lines = read_text(path).splitlines()
+    rows: list[dict[str, Any]] = []
+    for line in lines:
         if not line.startswith("| TQ-"):
             continue
         parts = [part.strip() for part in line.strip("|").split("|")]
         if len(parts) < 5:
             continue
-        rows.append(
+        rows.append(_normalize_question_row(
             {
                 "id": parts[0],
                 "document": parts[1],
@@ -40,8 +44,66 @@ def parse_question_set(path: Path) -> list[dict[str, str]]:
                 "expected": parts[4],
                 "expected_chunk_id": parts[5] if len(parts) > 5 else "",
             }
-        )
+        ))
+    rows.extend(_parse_markdown_question_blocks(lines))
     return rows
+
+
+def _normalize_question_row(row: dict[str | None, Any]) -> dict[str, Any]:
+    item = {str(key): str(value or "").strip() for key, value in row.items() if key}
+    question_id = item.get("id", "")
+    raw_history = item.pop("History JSON", item.pop("history_json", item.pop("history", "")))
+    item["history"] = _parse_history_json(raw_history, question_id) if raw_history else []
+    return item
+
+
+def _parse_markdown_question_blocks(lines: list[str]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    current: dict[str, str] | None = None
+
+    def append_current() -> None:
+        if current is not None and current.get("id") and current.get("question"):
+            rows.append(_normalize_question_row(current))
+
+    field_names = {
+        "Document": "document",
+        "Keyword": "keyword",
+        "Question": "question",
+        "Expected": "expected",
+        "Expected Chunk ID": "expected_chunk_id",
+        "Expected Chunk IDs": "expected_chunk_ids",
+        "History JSON": "History JSON",
+    }
+    for line in lines:
+        if line.startswith("## "):
+            append_current()
+            current = {"id": line[3:].strip()}
+            continue
+        if current is None or ":" not in line:
+            continue
+        field, value = line.split(":", 1)
+        key = field_names.get(field.strip())
+        if key:
+            current[key] = value.strip()
+    append_current()
+    return rows
+
+
+def _parse_history_json(value: object, question_id: str) -> list[dict[str, str]]:
+    try:
+        history = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Question {question_id!r} has invalid History JSON.") from exc
+    if not isinstance(history, list):
+        raise ValueError(f"Question {question_id!r} History JSON must be a list.")
+    valid_history: list[dict[str, str]] = []
+    for item in history:
+        if not isinstance(item, dict) or not isinstance(item.get("role"), str) or not isinstance(item.get("content"), str):
+            raise ValueError(
+                f"Question {question_id!r} History JSON items require string role and content."
+            )
+        valid_history.append({"role": item["role"], "content": item["content"]})
+    return valid_history
 
 
 def select_questions(questions: list[dict[str, str]], limit: int, seed: int | None) -> list[dict[str, str]]:
@@ -270,6 +332,162 @@ def build_retrieval_report(
     return {"summary": summarize_retrieval_records(records, retrieval_top_k, hit_k), "records": records}
 
 
+def build_rewrite_retrieval_report(
+    questions: list[dict[str, Any]],
+    *,
+    scenario: str | None = None,
+    retrieval_top_k: int = 20,
+    hit_k: int = 5,
+) -> dict[str, object]:
+    """Evaluate retrieval after query rewriting without retaining rewritten query text."""
+    from .main import hybrid_index, rag_service, settings
+
+    records: list[dict[str, object]] = []
+    for item in questions:
+        start = time.perf_counter()
+        rewrite_result = rag_service._rewrite_question(
+            {"question": item["question"], "history": item.get("history", [])}
+        )
+        rewritten_question = rewrite_result.get("rewritten_question", item["question"])
+        if not isinstance(rewritten_question, str) or not rewritten_question.strip():
+            rewritten_question = item["question"]
+        rewrite = _safe_rewrite_telemetry(rewrite_result.get("rewrite_debug"), rewritten_question)
+        sources, _ = hybrid_index.search(
+            rewritten_question,
+            scenario=scenario,
+            dense_top_k=settings.dense_top_k,
+            bm25_top_k=settings.bm25_top_k,
+            final_top_k=retrieval_top_k,
+            rrf_k=settings.rrf_k,
+        )
+        latency_ms = (time.perf_counter() - start) * 1000
+        expected_chunk_ids = parse_expected_chunk_ids(item)
+        if not expected_chunk_ids:
+            raise ValueError(f"Question {item['id']} is missing expected_chunk_id or expected_chunk_ids.")
+        source_chunk_ids = [source.chunk_id for source in sources]
+        first_rank = first_matching_chunk_rank(expected_chunk_ids, source_chunk_ids)
+        relevant_at_k = sum(1 for chunk_id in source_chunk_ids[:hit_k] if chunk_id in expected_chunk_ids)
+        records.append(
+            {
+                "id": item["id"],
+                "document": item["document"],
+                "keyword": item["keyword"],
+                "question": item["question"],
+                "expected": item["expected"],
+                "expected_chunk_id": str(item.get("expected_chunk_id", "")).strip(),
+                "expected_chunk_ids": sorted(expected_chunk_ids),
+                "first_relevant_rank": first_rank,
+                "first_document_rank": first_relevant_rank(
+                    str(item["document"]), [source.source_name for source in sources]
+                ),
+                f"hit@{hit_k}": first_rank is not None and first_rank <= hit_k,
+                f"precision@{hit_k}": relevant_at_k / hit_k,
+                f"recall@{hit_k}": relevant_at_k / len(expected_chunk_ids),
+                "reciprocal_rank": 0.0 if first_rank is None else 1.0 / first_rank,
+                "latency_ms": round(latency_ms, 2),
+                "rewrite": rewrite,
+                "source_chunk_ids": source_chunk_ids,
+                "source_documents": [source.source_name for source in sources],
+                "sources": [
+                    {
+                        "chunk_id": source.chunk_id,
+                        "source_name": source.source_name,
+                        "section": source.section,
+                        "page": source.page,
+                        "dense_rank": source.dense_rank,
+                        "bm25_rank": source.bm25_rank,
+                        "rrf_score": source.rrf_score,
+                        "rerank_rank": source.rerank_rank,
+                        "rerank_score": source.rerank_score,
+                    }
+                    for source in sources
+                ],
+            }
+        )
+    summary = summarize_retrieval_records(records, retrieval_top_k, hit_k)
+    summary["rewrite"] = _summarize_rewrite_telemetry(records)
+    return {"summary": summary, "records": records}
+
+
+def _safe_rewrite_telemetry(value: object, rewritten_question: str) -> dict[str, object]:
+    debug = value if isinstance(value, dict) else {}
+    mode = debug.get("mode")
+    return {
+        "mode": mode if isinstance(mode, str) and mode else "unknown",
+        "llm_called": debug.get("llm_called") is True,
+        "fallback_used": debug.get("fallback_used") is True,
+        "query_chars": len(rewritten_question),
+    }
+
+
+def _summarize_rewrite_telemetry(records: list[dict[str, object]]) -> dict[str, object]:
+    total = len(records)
+    telemetry = [record.get("rewrite") for record in records]
+    modes = Counter(
+        item.get("mode", "unknown")
+        for item in telemetry
+        if isinstance(item, dict) and isinstance(item.get("mode", "unknown"), str)
+    )
+    llm_calls = sum(
+        1 for item in telemetry if isinstance(item, dict) and item.get("llm_called") is True
+    )
+    fallbacks = sum(
+        1 for item in telemetry if isinstance(item, dict) and item.get("fallback_used") is True
+    )
+    return {
+        "llm_call_rate": round(llm_calls / total, 4) if total else 0.0,
+        "fallback_rate": round(fallbacks / total, 4) if total else 0.0,
+        "modes": dict(modes),
+    }
+
+
+def compare_rewrite_retrieval_reports(
+    baseline: dict[str, object], rewrite: dict[str, object]
+) -> dict[str, object]:
+    """Apply the release thresholds to separately generated baseline and rewrite reports."""
+    baseline_summary = baseline.get("summary") if isinstance(baseline.get("summary"), dict) else {}
+    rewrite_summary = rewrite.get("summary") if isinstance(rewrite.get("summary"), dict) else {}
+    hit_k = int(baseline_summary.get("hit_k", rewrite_summary.get("hit_k", 5)))
+    recall_key = f"recall@{hit_k}"
+    baseline_recall = float(baseline_summary.get(recall_key, 0.0))
+    rewrite_recall = float(rewrite_summary.get(recall_key, 0.0))
+    baseline_mrr = float(baseline_summary.get("MRR", 0.0))
+    rewrite_mrr = float(rewrite_summary.get("MRR", 0.0))
+    baseline_p95 = float(baseline_summary.get("P95_ms", 0.0))
+    rewrite_p95 = float(rewrite_summary.get("P95_ms", 0.0))
+    rewrite_metrics = rewrite_summary.get("rewrite") if isinstance(rewrite_summary.get("rewrite"), dict) else {}
+    llm_call_rate = float(rewrite_metrics.get("llm_call_rate", 0.0))
+    failed_gates: list[str] = []
+    if rewrite_recall < baseline_recall - MAX_RECALL_OR_MRR_DROP:
+        failed_gates.append(recall_key)
+    if rewrite_mrr < baseline_mrr - MAX_RECALL_OR_MRR_DROP:
+        failed_gates.append("MRR")
+    if llm_call_rate > MAX_LLM_CALL_RATE:
+        failed_gates.append("llm_call_rate")
+    if rewrite_p95 > baseline_p95 + MAX_P95_LATENCY_INCREASE_MS:
+        failed_gates.append("P95_ms")
+    rewrite_records = rewrite.get("records") if isinstance(rewrite.get("records"), list) else []
+    return {
+        "passed": not failed_gates,
+        "failed_gates": failed_gates,
+        "thresholds": {
+            "max_recall_or_mrr_drop": MAX_RECALL_OR_MRR_DROP,
+            "max_llm_call_rate": MAX_LLM_CALL_RATE,
+            "max_p95_latency_increase_ms": MAX_P95_LATENCY_INCREASE_MS,
+        },
+        "deltas": {
+            recall_key: round(rewrite_recall - baseline_recall, 4),
+            "MRR": round(rewrite_mrr - baseline_mrr, 4),
+            "P95_ms": round(rewrite_p95 - baseline_p95, 2),
+        },
+        "adaptive_misses": [
+            record.get("id")
+            for record in rewrite_records
+            if isinstance(record, dict) and record.get("first_relevant_rank") is None
+        ],
+    }
+
+
 def summarize_retrieval_records(
     records: list[dict[str, object]],
     retrieval_top_k: int,
@@ -288,6 +506,8 @@ def summarize_retrieval_records(
             "miss_count": 0,
             "relevance_unit": "exact_chunk_id",
             "mean_latency_ms": 0.0,
+            "P50_ms": 0.0,
+            "P95_ms": 0.0,
             "P99_ms": 0.0,
         }
     hit_count = sum(1 for record in records if record[f"hit@{hit_k}"])
@@ -306,6 +526,8 @@ def summarize_retrieval_records(
         "miss_count": sum(1 for record in records if record["first_relevant_rank"] is None),
         "relevance_unit": "exact_chunk_id",
         "mean_latency_ms": round(sum(latencies) / total, 2),
+        "P50_ms": round(percentile_nearest_rank(latencies, 50), 2),
+        "P95_ms": round(percentile_nearest_rank(latencies, 95), 2),
         "P99_ms": round(percentile_nearest_rank(latencies, 99), 2),
         "P99_definition": "99% of retrieval requests have latency less than or equal to this value.",
     }
@@ -365,11 +587,13 @@ def main() -> None:
     parser.add_argument("--answers-output", type=Path, default=Path("ragas_records.jsonl"))
     parser.add_argument("--ragas-output", type=Path, default=Path("ragas_summary.json"))
     parser.add_argument("--retrieval-output", type=Path, default=Path("retrieval_report.json"))
+    parser.add_argument("--rewrite-retrieval-output", type=Path, default=Path("rewrite_retrieval_report.json"))
     parser.add_argument("--scenario", default=None)
     parser.add_argument("--hit-k", type=int, default=5)
     parser.add_argument("--retrieval-top-k", type=int, default=20)
     parser.add_argument("--generate-answers", action="store_true")
     parser.add_argument("--run-retrieval", action="store_true")
+    parser.add_argument("--run-rewrite-retrieval", action="store_true")
     parser.add_argument("--run-ragas", action="store_true")
     parser.add_argument("--ragas-model", default=None)
     args = parser.parse_args()
@@ -403,6 +627,17 @@ def main() -> None:
         args.retrieval_output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
         print(f"Wrote retrieval report to {args.retrieval_output}")
+    if args.run_rewrite_retrieval:
+        report = build_rewrite_retrieval_report(
+            questions,
+            scenario=args.scenario,
+            retrieval_top_k=args.retrieval_top_k,
+            hit_k=args.hit_k,
+        )
+        args.rewrite_retrieval_output.parent.mkdir(parents=True, exist_ok=True)
+        args.rewrite_retrieval_output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
+        print(f"Wrote rewrite retrieval report to {args.rewrite_retrieval_output}")
     if not args.generate_answers and not args.run_ragas:
         return
     args.answers_output.parent.mkdir(parents=True, exist_ok=True)

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from .document_parsers import DocumentParseResult, ParsedBlock, delimited_table_to_block, read_text
+from .ingestion_cleaning import chunk_rejection_reason, is_duplicate_or_overlap
 
 
 SUPPORTED_EXTENSIONS = {
@@ -42,6 +43,9 @@ class RawDocument:
     source_name: str
     file_type: str
     scenario: str
+    source_key: str = ""
+    source_root: str = ""
+    file_hash: str = ""
     page: int | None = None
     section: str | None = None
     content_type: str = "text"
@@ -115,17 +119,41 @@ def load_one(
     include_images: bool = True,
     mime_type: str | None = None,
 ) -> list[RawDocument]:
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    source_key = resolved_path.relative_to(resolved_root).as_posix()
+    source_root = str(resolved_root)
+    file_hash = source_file_hash(resolved_path)
     suffix = path.suffix.lower()
     scenario = derive_scenario(path, root)
     if suffix in {".csv", ".tsv"}:
         block = delimited_table_to_block(path, "," if suffix == ".csv" else "\t")
-        return [_to_raw_document(block, path, scenario)]
+        return [_to_raw_document(block, path, scenario, source_key, source_root, file_hash)]
     if suffix in {".md", ".txt", ".xlsx", ".pdf"} | IMAGE_EXTENSIONS or _is_supported_mime_type(mime_type):
         parsed = parsers.parse(path, scenario, include_images=include_images, mime_type=mime_type)
         if isinstance(parsed, DocumentParseResult):
-            return [_to_raw_document(block, path, scenario, file_type=parsed.file_type) for block in parsed.blocks]
-        return [_to_raw_document(block, path, scenario) for block in parsed]
+            return [
+                _to_raw_document(
+                    block,
+                    path,
+                    scenario,
+                    source_key,
+                    source_root,
+                    file_hash,
+                    file_type=parsed.file_type,
+                )
+                for block in parsed.blocks
+            ]
+        return [_to_raw_document(block, path, scenario, source_key, source_root, file_hash) for block in parsed]
     return []
+
+
+def source_file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _mime_type_for_path(path: Path, mime_types: dict[str, str] | None) -> str | None:
@@ -154,6 +182,8 @@ def split_documents(documents: list[RawDocument], chunk_size: int, chunk_overlap
         separators=["\n## ", "\n### ", "\n\n", "\n", "。", "；", "，", " ", ""],
     )
     chunks: list[DocumentChunk] = []
+    seen_by_source: dict[str, set[str]] = {}
+    seen_normalized_by_source: dict[str, list[str]] = {}
     for document_index, document in enumerate(documents):
         if document.content_type == "table":
             parts = [(part, "table") for part in split_table_markdown(document.text, chunk_size)]
@@ -164,11 +194,21 @@ def split_documents(documents: list[RawDocument], chunk_size: int, chunk_overlap
             clean_text = part.strip()
             if not clean_text:
                 continue
+            if content_type not in {"table", "table_row"}:
+                if chunk_rejection_reason(clean_text, content_type=content_type):
+                    continue
+                seen = seen_by_source.setdefault(document.source_path, set())
+                seen_normalized = seen_normalized_by_source.setdefault(document.source_path, [])
+                if is_duplicate_or_overlap(clean_text, seen, seen_normalized):
+                    continue
             chunk_id = make_chunk_id(document.source_path, document.page, document_index, index, clean_text)
             metadata = {
                 "chunk_id": chunk_id,
                 "source_path": document.source_path,
                 "source_name": document.source_name,
+                "source_key": document.source_key,
+                "source_root": document.source_root,
+                "file_hash": document.file_hash,
                 "file_type": document.file_type,
                 "scenario": document.scenario,
                 "section": document.section or infer_section(clean_text),
@@ -259,16 +299,27 @@ def _to_raw_document(
     block: ParsedBlock | RawDocument,
     path: Path,
     scenario: str,
+    source_key: str,
+    source_root: str,
+    file_hash: str,
     file_type: str | None = None,
 ) -> RawDocument:
     if isinstance(block, RawDocument):
-        return block
+        return replace(
+            block,
+            source_key=source_key,
+            source_root=source_root,
+            file_hash=file_hash,
+        )
     return RawDocument(
         text=block.text,
         source_path=str(path),
         source_name=path.name,
         file_type=file_type or path.suffix.lower().lstrip("."),
         scenario=scenario,
+        source_key=source_key,
+        source_root=source_root,
+        file_hash=file_hash,
         page=block.page,
         section=block.section,
         content_type=block.content_type,

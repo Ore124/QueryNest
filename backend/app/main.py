@@ -6,38 +6,55 @@ import os
 import shutil
 import threading
 import uuid
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .cache import NullJsonCache, RedisJsonCache
+from .auth import Actor, get_current_actor, hash_password, verify_password
 from .document_parsers import DocumentParserRouter
-from .documents import discover_files, load_documents, split_documents
+from .documents import DocumentChunk, discover_files, load_documents, split_documents
 from .graph import RagService
-from .history import ChatHistoryStore, RedisChatHistoryStore
+from .history import CachedChatHistoryStore, ConversationAccessDenied, PostgresChatHistoryStore, RedisChatHistoryStore, UsernameAlreadyExists
 from .image_ocr import PaddleOcrParser
 from .index import HybridIndex, MILVUS_SPARSE_FIELD
 from .kb_metadata import ActiveIngestJobExists, IngestJobState, PostgresMetadataStore
+from .memory import PostgresSessionMemoryStore, SessionMemoryService
+from .personal_memory import NoopPersonalMemoryIndex, PersonalMemoryService, PostgresPersonalMemoryStore
 from .mineru_api_client import MineruApiClient, MineruApiClientConfig
 from .pdf_parse_router import PdfParseRouter, PdfParseRouterConfig
-from .providers import CachedEmbeddings, get_embeddings
+from .providers import CachedEmbeddings, get_chat_model, get_embeddings
 from .rebuild_locks import KbRebuildLockBusy, PostgresAdvisoryKbRebuildLock, RedisKbRebuildLock
 from .reranker import create_reranker
 from .schemas import (
     ChatRequest,
     ChatResponse,
+    AdminConversationResponse,
+    AdminUserResponse,
     ChunkListResponse,
     ChunkView,
+    CreatedUserResponse,
+    CreatePersonalUserRequest,
+    DocumentDeleteResponse,
     DocumentListResponse,
     DocumentView,
     HealthResponse,
     IngestPathRequest,
     IngestResponse,
+    LoginRequest,
     ModelInfo,
     ScenarioResponse,
+    TokenResponse,
+    ConversationResponse,
+    ConversationMessageResponse,
+    DeleteConversationsRequest,
+    PersonalMemoryResponse,
+    UpdatePersonalMemoryRequest,
     WarmupResponse,
 )
 from .settings import Settings, get_settings
@@ -45,6 +62,28 @@ from .settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+STALE_INGEST_JOB_SECONDS = 1800
+
+
+def _create_history_store(settings: Settings, metadata_store: PostgresMetadataStore):
+    metadata_store.run_migrations()
+    settings.auth_jwt_secret = metadata_store.get_or_create_auth_jwt_secret(settings.auth_jwt_secret)
+    primary = PostgresChatHistoryStore(settings.postgres_dsn)
+    if not settings.redis_url:
+        return primary
+    cache = RedisChatHistoryStore(
+        settings.redis_url,
+        key_prefix=settings.redis_key_prefix,
+        ttl_seconds=settings.redis_session_ttl_seconds,
+        max_messages=settings.history_cache_max_messages,
+    )
+    return CachedChatHistoryStore(
+        primary,
+        cache,
+        cache_max_messages=settings.history_cache_max_messages,
+    )
+
+
 cache_store = (
     RedisJsonCache(
         settings.redis_url,
@@ -55,7 +94,32 @@ cache_store = (
     else NullJsonCache()
 )
 metadata_store = PostgresMetadataStore(settings.postgres_dsn)
-metadata_store.run_migrations()
+history_store = _create_history_store(settings, metadata_store)
+
+
+class _MemoryExtractionChatModel:
+    """Create the configured chat model only when a completed turn is extracted."""
+
+    def invoke(self, messages: list[object]) -> object:
+        return get_chat_model(
+            settings,
+            temperature=0.0,
+            thinking=False,
+            max_tokens=700,
+        ).invoke(messages)
+
+
+session_memory_store = PostgresSessionMemoryStore(settings.postgres_dsn)
+session_memory_service = SessionMemoryService(session_memory_store, _MemoryExtractionChatModel())
+personal_memory_store = PostgresPersonalMemoryStore(settings.postgres_dsn)
+personal_memory_store.run_migrations()
+personal_memory_service = PersonalMemoryService(
+    personal_memory_store,
+    _MemoryExtractionChatModel(),
+    index=NoopPersonalMemoryIndex(),
+    default_ttl_days=settings.personal_memory_default_ttl_days,
+    extraction_max_items=settings.personal_memory_extraction_max_items,
+)
 rebuild_lock = (
     RedisKbRebuildLock(cache_store.client)
     if isinstance(cache_store, RedisJsonCache)
@@ -89,17 +153,13 @@ hybrid_index = HybridIndex(
     kb_id=settings.kb_id,
 )
 hybrid_index.load()
-history_store = (
-    RedisChatHistoryStore(
-        settings.redis_url,
-        key_prefix=settings.redis_key_prefix,
-        ttl_seconds=settings.redis_session_ttl_seconds,
-        max_messages=settings.redis_history_max_messages,
-    )
-    if settings.redis_url
-    else ChatHistoryStore(settings.resolved_sqlite_path)
+rag_service = RagService(
+    settings,
+    hybrid_index,
+    history_store,
+    memory_service=session_memory_service,
+    personal_memory_service=personal_memory_service,
 )
-rag_service = RagService(settings, hybrid_index, history_store)
 image_ocr_parser = PaddleOcrParser(
     language=settings.paddleocr_language,
     device=settings.paddleocr_device,
@@ -114,17 +174,215 @@ embedding_warmed = False
 embedding_warmup_lock = threading.Lock()
 
 app = FastAPI(title="QueryNest", version="0.1.0")
+_bearer_scheme = HTTPBearer(auto_error=False)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin, "http://127.0.0.1:5173", "http://localhost:5173"],
+    allow_origin_regex=r"https?://(127\.0\.0\.1|localhost):\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+def _primary_history_store() -> PostgresChatHistoryStore:
+    return history_store.primary if isinstance(history_store, CachedChatHistoryStore) else history_store
+
+
+def _current_actor(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> Actor:
+    return get_current_actor(credentials, settings, _primary_history_store())
+
+
+@app.on_event("startup")
+def bootstrap_admin() -> None:
+    username = settings.auth_bootstrap_admin_username.strip()
+    password = settings.auth_bootstrap_admin_password
+    if not username or not password:
+        return
+    primary = _primary_history_store()
+    if not isinstance(primary, PostgresChatHistoryStore):
+        return
+    primary.bootstrap_admin(username, hash_password(password))
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login(request: LoginRequest) -> TokenResponse:
+    user = _primary_history_store().find_user_by_username(request.username.strip())
+    if user is None or not bool(user["is_active"]) or not verify_password(request.password, str(user["password_hash"])):
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    actor = Actor(user_id=uuid.UUID(str(user["user_id"])), role=str(user["role"]))
+    from .auth import create_access_token
+
+    return TokenResponse(access_token=create_access_token(actor, settings))
+
+
+@app.post("/api/admin/users", response_model=CreatedUserResponse, status_code=status.HTTP_201_CREATED)
+def create_personal_user(
+    request: CreatePersonalUserRequest, actor: Actor = Depends(_current_actor)
+) -> CreatedUserResponse:
+    if actor.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access is required.")
+    try:
+        user = _primary_history_store().create_personal_user(
+            str(actor.user_id), request.username, hash_password(request.password)
+        )
+    except UsernameAlreadyExists as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already exists.") from exc
+    return CreatedUserResponse(**user)
+
+
+def _require_admin(actor: Actor) -> None:
+    if actor.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access is required.")
+
+
+@app.get("/api/admin/users", response_model=list[AdminUserResponse])
+def list_users(actor: Actor = Depends(_current_actor)) -> list[AdminUserResponse]:
+    _require_admin(actor)
+    return [AdminUserResponse(**user) for user in _primary_history_store().list_users_for_admin()]
+
+
+@app.get("/api/admin/conversations", response_model=list[AdminConversationResponse])
+def list_admin_conversations(
+    owner_user_id: uuid.UUID,
+    limit: int = Query(default=100, ge=1, le=500),
+    actor: Actor = Depends(_current_actor),
+) -> list[AdminConversationResponse]:
+    _require_admin(actor)
+    try:
+        conversations = _primary_history_store().list_conversations_for_admin(
+            str(actor.user_id), str(owner_user_id), limit
+        )
+    except ConversationAccessDenied as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.") from exc
+    return [AdminConversationResponse(**conversation) for conversation in conversations]
+
+
+@app.get(
+    "/api/admin/conversations/{session_id}/messages",
+    response_model=list[ConversationMessageResponse],
+)
+def list_admin_conversation_messages(
+    session_id: uuid.UUID,
+    limit: int = Query(default=500, ge=1, le=1000),
+    actor: Actor = Depends(_current_actor),
+) -> list[ConversationMessageResponse]:
+    _require_admin(actor)
+    try:
+        messages = _primary_history_store().load_messages_for_user(
+            str(actor.user_id), str(session_id), limit
+        )
+    except ConversationAccessDenied as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.") from exc
+    return [ConversationMessageResponse(**message) for message in messages]
+
+
+@app.get("/api/conversations", response_model=list[ConversationResponse])
+def list_conversations(
+    limit: int = Query(default=100, ge=1, le=500), actor: Actor = Depends(_current_actor)
+) -> list[ConversationResponse]:
+    try:
+        conversations = _primary_history_store().list_conversations_for_user(str(actor.user_id), limit)
+    except ConversationAccessDenied as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversations not found.") from exc
+    return [ConversationResponse(**conversation) for conversation in conversations]
+
+
+@app.delete("/api/conversations", status_code=status.HTTP_204_NO_CONTENT)
+def delete_conversations(
+    request: DeleteConversationsRequest, actor: Actor = Depends(_current_actor)
+) -> None:
+    try:
+        _primary_history_store().delete_conversations_for_owner(
+            str(actor.user_id), [str(session_id) for session_id in request.session_ids]
+        )
+    except ConversationAccessDenied as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.") from exc
+
+
+@app.get("/api/conversations/{session_id}/messages", response_model=list[ConversationMessageResponse])
+def list_conversation_messages(
+    session_id: uuid.UUID,
+    limit: int = Query(default=500, ge=1, le=1000),
+    actor: Actor = Depends(_current_actor),
+) -> list[ConversationMessageResponse]:
+    try:
+        messages = _primary_history_store().load_messages_for_owner(str(actor.user_id), str(session_id), limit)
+    except ConversationAccessDenied as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.") from exc
+    return [ConversationMessageResponse(**message) for message in messages]
+
+
+def _personal_memory_response(memory: dict[str, Any]) -> PersonalMemoryResponse:
+    return PersonalMemoryResponse(
+        memory_id=memory["memory_id"],
+        memory_type=memory["memory_type"],
+        key=memory["key"],
+        value=memory["value"],
+        confidence=memory["confidence"],
+        source_session_id=memory["source_session_id"],
+        expires_at=memory["expires_at"],
+    )
+
+
+def _require_explicit_memory_owner(actor: Actor, owner_user_id: uuid.UUID | None) -> str | None:
+    """Require an administrator's mutation target before any cross-owner storage access."""
+    if actor.role == "admin" and owner_user_id is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found.")
+    return str(owner_user_id) if owner_user_id is not None else None
+
+
+@app.get("/api/memories", response_model=list[PersonalMemoryResponse])
+def list_personal_memories(
+    owner_user_id: uuid.UUID | None = Query(default=None), actor: Actor = Depends(_current_actor)
+) -> list[PersonalMemoryResponse]:
+    target_user_id = str(owner_user_id or actor.user_id)
+    if owner_user_id is not None and actor.role != "admin" and target_user_id != str(actor.user_id):
+        return []
+    return [_personal_memory_response(memory) for memory in personal_memory_store.list_for_actor(actor, target_user_id)]
+
+
+@app.patch("/api/memories/{memory_id}", response_model=PersonalMemoryResponse)
+def update_personal_memory(
+    memory_id: uuid.UUID, request: UpdatePersonalMemoryRequest,
+    owner_user_id: uuid.UUID | None = Query(default=None), actor: Actor = Depends(_current_actor)
+) -> PersonalMemoryResponse:
+    changes = request.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="At least one field is required.")
+    expected_owner_user_id = _require_explicit_memory_owner(actor, owner_user_id)
+    column_names = {"key": "memory_key", "value": "memory_value"}
+    try:
+        memory = personal_memory_store.update_for_actor(
+            actor, str(memory_id), {column_names.get(key, key): value for key, value in changes.items()}, expected_owner_user_id
+        )
+    except Exception as exc:
+        from .personal_memory import PersonalMemoryAccessDenied
+        if isinstance(exc, PersonalMemoryAccessDenied):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found.") from exc
+        raise
+    return _personal_memory_response(memory)
+
+
+@app.delete("/api/memories/{memory_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_personal_memory(
+    memory_id: uuid.UUID, owner_user_id: uuid.UUID | None = Query(default=None), actor: Actor = Depends(_current_actor)
+) -> None:
+    try:
+        expected_owner_user_id = _require_explicit_memory_owner(actor, owner_user_id)
+        personal_memory_service.delete_memory(actor, str(memory_id), expected_owner_user_id)
+    except Exception as exc:
+        from .personal_memory import PersonalMemoryAccessDenied
+        if isinstance(exc, PersonalMemoryAccessDenied):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found.") from exc
+        raise
+
+
 @app.get("/api/health", response_model=HealthResponse)
 def health() -> HealthResponse:
+    history_cache_connected = _history_cache_connected(history_store)
     return HealthResponse(
         status="ok",
         index_ready=hybrid_index.ready,
@@ -132,12 +390,19 @@ def health() -> HealthResponse:
         default_chat_model=settings.resolved_llm_model,
         default_embedding_model=settings.resolved_embedding_model,
         history_backend=history_store.backend,
-        redis_connected=history_store.ping() if history_store.backend == "redis" else None,
+        redis_connected=history_cache_connected,
+        history_cache_connected=history_cache_connected,
         cache_backend=cache_store.backend,
         cache_connected=cache_store.ping() if cache_store.backend == "redis" else None,
         index_origin=hybrid_index.origin,
         index_build_count=hybrid_index.build_count,
     )
+
+
+def _history_cache_connected(history_store: object) -> bool | None:
+    if not isinstance(history_store, CachedChatHistoryStore):
+        return None
+    return history_store.cache.ping()
 
 
 @app.get("/api/scenarios", response_model=ScenarioResponse)
@@ -178,6 +443,44 @@ def documents(scenario: str | None = None) -> DocumentListResponse:
         )
     ]
     return DocumentListResponse(documents=views, total=len(views))
+
+
+@app.delete("/api/documents", response_model=DocumentDeleteResponse)
+def delete_document(source_path: str = Query(min_length=1)) -> DocumentDeleteResponse:
+    with _rebuild_lock_context(settings.kb_id, None):
+        existing = _snapshot_chunks(hybrid_index)
+        deleted_chunks = [
+            chunk
+            for chunk in existing
+            if str(chunk.metadata.get("source_path", "")) == source_path
+        ]
+        if not deleted_chunks:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        remaining = [
+            chunk
+            for chunk in existing
+            if str(chunk.metadata.get("source_path", "")) != source_path
+        ]
+        hybrid_index.build(remaining)
+        metadata_store.write_index_snapshot(
+            kb_id=settings.kb_id,
+            index_version=hybrid_index.index_revision,
+            raw_documents=[],
+            chunks=remaining,
+            embedding_model=settings.resolved_embedding_model,
+            chunker_version=settings.chunker_version,
+            parser_version=settings.parser_version,
+            milvus_collection=settings.milvus_collection_name,
+            milvus_sparse_field=MILVUS_SPARSE_FIELD,
+        )
+        hybrid_index.metadata_store = metadata_store
+        if remaining and not hybrid_index.load():
+            raise RuntimeError("Index snapshot was written but PostgreSQL/Milvus hybrid reload failed.")
+    return DocumentDeleteResponse(
+        source_path=source_path,
+        deleted_chunks=len(deleted_chunks),
+        remaining_documents=_document_group_count(remaining),
+    )
 
 
 @app.get("/api/chunks", response_model=ChunkListResponse)
@@ -256,6 +559,11 @@ def ingest_path(request: IngestPathRequest) -> IngestResponse:
     return _ingest_from_path(request.path, request.rebuild, request.include_images)
 
 
+@app.post("/api/ingest/rebuild", response_model=IngestResponse)
+def rebuild_ingested_sources() -> IngestResponse:
+    return _rebuild_from_indexed_source_roots()
+
+
 @app.post("/api/ingest/files", response_model=IngestResponse)
 async def ingest_files(
     files: list[UploadFile] = File(...),
@@ -281,15 +589,16 @@ async def ingest_files(
         ingest_root,
         include_images,
     )
-    return _ingest_from_path(ingest_root, rebuild=True, include_images=include_images, mime_types=mime_types)
+    return _ingest_from_path(ingest_root, rebuild=False, include_images=include_images, mime_types=mime_types)
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
+def chat(request: ChatRequest, actor: Actor = Depends(_current_actor)) -> ChatResponse:
     if not hybrid_index.ready:
         raise HTTPException(status_code=409, detail="Index is not ready. Run ingestion first.")
     try:
         return rag_service.chat(
+            actor=actor,
             message=request.message,
             session_id=request.session_id,
             scenario=request.scenario,
@@ -297,6 +606,9 @@ def chat(request: ChatRequest) -> ChatResponse:
             top_k=request.top_k,
             agentic=request.agentic,
         )
+    except ConversationAccessDenied as exc:
+        # Do not reveal whether another user's conversation exists.
+        raise HTTPException(status_code=404, detail="Conversation not found.") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -353,6 +665,140 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+@dataclass
+class IngestChangeCounts:
+    added_documents: int = 0
+    updated_documents: int = 0
+    skipped_documents: int = 0
+    deleted_documents: int = 0
+    moved_documents: int = 0
+
+    @property
+    def changed_documents(self) -> int:
+        return self.added_documents + self.updated_documents + self.deleted_documents + self.moved_documents
+
+    def as_response_fields(self) -> dict[str, int]:
+        return {
+            "added_documents": self.added_documents,
+            "updated_documents": self.updated_documents,
+            "skipped_documents": self.skipped_documents,
+            "deleted_documents": self.deleted_documents,
+            "moved_documents": self.moved_documents,
+        }
+
+
+def _snapshot_chunks(index: HybridIndex) -> list[DocumentChunk]:
+    return [
+        DocumentChunk(
+            chunk_id=str(row["chunk_id"]),
+            text=str(row["text"]),
+            metadata=dict(row.get("metadata", {})),
+        )
+        for row in index.chunks
+    ]
+
+
+def _document_identity(chunk: DocumentChunk) -> tuple[str, str]:
+    return (
+        str(chunk.metadata.get("source_root", "")),
+        str(chunk.metadata.get("source_key", "")),
+    )
+
+
+def _document_groups(chunks: list[DocumentChunk]) -> dict[tuple[str, str], list[DocumentChunk]]:
+    groups: dict[tuple[str, str], list[DocumentChunk]] = {}
+    for chunk in chunks:
+        groups.setdefault(_document_identity(chunk), []).append(chunk)
+    return groups
+
+
+def _document_group_count(chunks: list[DocumentChunk]) -> int:
+    return len(_document_groups(chunks))
+
+
+def _file_hash(chunks: list[DocumentChunk]) -> str:
+    return str(chunks[0].metadata.get("file_hash", "")) if chunks else ""
+
+
+def _append_uploaded_chunks(
+    existing: list[DocumentChunk], incoming: list[DocumentChunk]
+) -> tuple[list[DocumentChunk], IngestChangeCounts]:
+    """Append uploaded documents whose content is not already indexed."""
+    existing_hashes = {
+        _file_hash(document_chunks)
+        for document_chunks in _document_groups(existing).values()
+    }
+    counts = IngestChangeCounts()
+    accepted_chunks: list[DocumentChunk] = []
+    seen_hashes = set(existing_hashes)
+    for document_chunks in _document_groups(incoming).values():
+        file_hash = _file_hash(document_chunks)
+        if file_hash in seen_hashes:
+            counts.skipped_documents += 1
+            continue
+        seen_hashes.add(file_hash)
+        accepted_chunks.extend(document_chunks)
+        counts.added_documents += 1
+    return existing + accepted_chunks, counts
+
+
+def _sync_snapshot(
+    existing: list[DocumentChunk],
+    incoming: list[DocumentChunk],
+    source_root: str,
+) -> tuple[list[DocumentChunk], IngestChangeCounts]:
+    """Create the next snapshot for one authoritative directory source."""
+    existing_groups = _document_groups(existing)
+    incoming_groups = _document_groups(incoming)
+    existing_root_groups = {
+        key: chunks for key, chunks in existing_groups.items() if key[0] == source_root and key[1]
+    }
+    incoming_root_groups = {
+        key: chunks for key, chunks in incoming_groups.items() if key[0] == source_root and key[1]
+    }
+    counts = IngestChangeCounts()
+    next_chunks = [
+        chunk
+        for chunk in existing
+        if not (_document_identity(chunk)[0] == source_root and _document_identity(chunk)[1])
+    ]
+    incoming_keys = set(incoming_root_groups)
+    moved_keys: set[tuple[str, str]] = set()
+
+    for key, new_chunks in incoming_root_groups.items():
+        old_chunks = existing_root_groups.get(key)
+        if old_chunks is not None:
+            if _file_hash(old_chunks) == _file_hash(new_chunks):
+                next_chunks.extend(old_chunks)
+                counts.skipped_documents += 1
+            else:
+                next_chunks.extend(new_chunks)
+                counts.updated_documents += 1
+            continue
+
+        moved_key = next(
+            (
+                old_key
+                for old_key, old_chunks in existing_root_groups.items()
+                if old_key not in incoming_keys
+                and old_key not in moved_keys
+                and _file_hash(old_chunks) == _file_hash(new_chunks)
+            ),
+            None,
+        )
+        next_chunks.extend(new_chunks)
+        if moved_key is None:
+            counts.added_documents += 1
+        else:
+            moved_keys.add(moved_key)
+            counts.moved_documents += 1
+
+    for key in existing_root_groups:
+        if key not in incoming_keys and key not in moved_keys:
+            counts.deleted_documents += 1
+    return next_chunks, counts
+
+
 def _ingest_from_path(
     path: Path,
     rebuild: bool,
@@ -390,7 +836,7 @@ def _ingest_from_path(
             len(chunks),
             include_images,
         )
-        if not chunks:
+        if not chunks and (rebuild or mime_types is not None):
             raise HTTPException(status_code=400, detail="No supported documents found.")
         metadata_store.update_ingest_job(job_state.job_id, status="embedding")
         metadata_store.upsert_document_status(
@@ -405,12 +851,50 @@ def _ingest_from_path(
         )
         try:
             with _rebuild_lock_context(settings.kb_id, job_state):
-                hybrid_index.build(chunks, rebuild=rebuild)
+                index_chunks = chunks
+                change_counts = IngestChangeCounts()
+                if not rebuild:
+                    existing_chunks = _snapshot_chunks(hybrid_index)
+                    if mime_types is None:
+                        index_chunks, change_counts = _sync_snapshot(
+                            existing_chunks,
+                            chunks,
+                            str(path.resolve()),
+                        )
+                    else:
+                        index_chunks, change_counts = _append_uploaded_chunks(existing_chunks, chunks)
+                else:
+                    change_counts = IngestChangeCounts(added_documents=_document_group_count(chunks))
+
+                if not rebuild and not change_counts.changed_documents:
+                    metadata_store.upsert_document_status(
+                        kb_id=settings.kb_id,
+                        doc_id=source["doc_id"],
+                        file_name=source["file_name"],
+                        file_hash=source["file_hash"],
+                        status="indexed",
+                        parser="ingest-request",
+                        parser_version=settings.parser_version,
+                        metadata=source["metadata"],
+                    )
+                    metadata_store.update_ingest_job(job_state.job_id, status="completed")
+                    return IngestResponse(
+                        indexed_chunks=len(hybrid_index.chunks),
+                        source_documents=len(raw_documents),
+                        scenarios=hybrid_index.scenarios(),
+                        artifact_dir=str(settings.resolved_artifact_dir),
+                        notices=_ingest_notices(raw_documents),
+                        doc_id=source["doc_id"],
+                        ingest_job_id=job_state.job_id,
+                        ingest_status="completed",
+                        **change_counts.as_response_fields(),
+                    )
+                hybrid_index.build(index_chunks, rebuild=rebuild)
                 metadata_store.write_index_snapshot(
                     kb_id=settings.kb_id,
                     index_version=hybrid_index.index_revision,
                     raw_documents=raw_documents,
-                    chunks=chunks,
+                    chunks=index_chunks,
                     embedding_model=settings.resolved_embedding_model,
                     chunker_version=settings.chunker_version,
                     parser_version=settings.parser_version,
@@ -418,7 +902,7 @@ def _ingest_from_path(
                     milvus_sparse_field=MILVUS_SPARSE_FIELD,
                 )
                 hybrid_index.metadata_store = metadata_store
-                if not hybrid_index.load():
+                if index_chunks and not hybrid_index.load():
                     raise RuntimeError("Index snapshot was written but PostgreSQL/Milvus hybrid reload failed.")
                 metadata_store.upsert_document_status(
                     kb_id=settings.kb_id,
@@ -460,6 +944,7 @@ def _ingest_from_path(
             doc_id=source["doc_id"],
             ingest_job_id=job_state.job_id,
             ingest_status="completed",
+            **change_counts.as_response_fields(),
         )
     except HTTPException as exc:
         if job_state is not None:
@@ -471,7 +956,77 @@ def _ingest_from_path(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+def _rebuild_from_indexed_source_roots() -> IngestResponse:
+    existing_chunks = _snapshot_chunks(hybrid_index)
+    source_roots = sorted(
+        {
+            str(chunk.metadata.get("source_root", ""))
+            for chunk in existing_chunks
+            if chunk.metadata.get("source_root")
+        }
+    )
+    if not source_roots:
+        raise HTTPException(status_code=409, detail="No retained source roots are available for rebuild.")
+    missing_roots = [source_root for source_root in source_roots if not Path(source_root).is_dir()]
+    if missing_roots:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot rebuild: source root is unavailable: {missing_roots[0]}",
+        )
+
+    raw_documents = [
+        document
+        for source_root in source_roots
+        for document in load_documents(Path(source_root), document_parsers, include_images=True)
+    ]
+    chunks = split_documents(raw_documents, settings.chunk_size, settings.chunk_overlap)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No supported documents found in retained source roots.")
+
+    try:
+        with _rebuild_lock_context(settings.kb_id, None):
+            hybrid_index.build(chunks, rebuild=True)
+            metadata_store.write_index_snapshot(
+                kb_id=settings.kb_id,
+                index_version=hybrid_index.index_revision,
+                raw_documents=raw_documents,
+                chunks=chunks,
+                embedding_model=settings.resolved_embedding_model,
+                chunker_version=settings.chunker_version,
+                parser_version=settings.parser_version,
+                milvus_collection=settings.milvus_collection_name,
+                milvus_sparse_field=MILVUS_SPARSE_FIELD,
+            )
+            hybrid_index.metadata_store = metadata_store
+            if not hybrid_index.load():
+                raise RuntimeError("Index snapshot was written but PostgreSQL/Milvus hybrid reload failed.")
+    except KbRebuildLockBusy:
+        return IngestResponse(
+            indexed_chunks=len(hybrid_index.chunks),
+            source_documents=0,
+            scenarios=hybrid_index.scenarios(),
+            artifact_dir=str(settings.resolved_artifact_dir),
+            notices=[],
+            ingest_status="rebuild_locked",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return IngestResponse(
+        indexed_chunks=len(chunks),
+        source_documents=len(raw_documents),
+        scenarios=hybrid_index.scenarios(),
+        artifact_dir=str(settings.resolved_artifact_dir),
+        notices=_ingest_notices(raw_documents),
+        added_documents=_document_group_count(chunks),
+    )
+
+
 def _claim_ingest_job(source: dict[str, object]) -> IngestJobState:
+    metadata_store.expire_stale_ingest_jobs(
+        doc_id=str(source["doc_id"]),
+        timeout_seconds=STALE_INGEST_JOB_SECONDS,
+    )
     active = metadata_store.get_active_ingest_job(str(source["doc_id"]))
     if active is not None:
         return active

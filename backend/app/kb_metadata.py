@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import threading
 import uuid
 from dataclasses import dataclass
@@ -89,6 +90,29 @@ class PostgresMetadataStore:
                         "INSERT INTO schema_migrations(version) VALUES (%s) ON CONFLICT DO NOTHING",
                         (version,),
                     )
+
+    def get_or_create_auth_jwt_secret(self, configured_secret: str = "") -> str:
+        """Return an explicit deployment override or a durable generated secret.
+
+        The insert uses PostgreSQL's conflict handling so concurrent application
+        startups all converge on the same database value.
+        """
+        if configured_secret:
+            return configured_secret
+
+        generated_secret = secrets.token_urlsafe(48)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO application_secrets(secret_name, secret_value)
+                VALUES ('auth_jwt_secret', %s)
+                ON CONFLICT (secret_name) DO UPDATE
+                SET secret_value = application_secrets.secret_value
+                RETURNING secret_value
+                """,
+                (generated_secret,),
+            ).fetchone()
+        return str(row[0])
 
     def ensure_knowledge_base(self, kb_id: str, *, name: str | None = None) -> None:
         with self._connect() as conn:
@@ -196,6 +220,24 @@ class PostgresMetadataStore:
                 (doc_id,),
             ).fetchone()
         return _job_state(row) if row else None
+
+    def expire_stale_ingest_jobs(self, *, doc_id: str, timeout_seconds: int) -> int:
+        with self._connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status = 'failed',
+                    retry_count = retry_count + 1,
+                    error_message = 'Ingestion job expired before completion.',
+                    updated_at = now(),
+                    finished_at = now()
+                WHERE doc_id = %s
+                  AND status IN ('queued', 'running', 'uploading', 'parsing', 'embedding')
+                  AND updated_at < now() - (%s * interval '1 second')
+                """,
+                (doc_id, timeout_seconds),
+            )
+        return int(result.rowcount or 0)
 
     def update_ingest_job(
         self,

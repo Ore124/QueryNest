@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any, TypedDict
 
@@ -8,6 +9,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 
 from .history import HistoryStore
+from .auth import Actor
+from .context_selection import select_context_sources
 from .index import HybridIndex
 from .providers import get_chat_model
 from .schemas import ChatResponse, Source
@@ -17,13 +20,51 @@ from .settings import Settings
 MAX_AGENTIC_QUERIES = 3
 MAX_AGENTIC_ATTEMPTS = 2
 MIN_CONTEXT_CHARS_FOR_JUDGEMENT = 8
+MAX_SESSION_MEMORY_CONTEXT_CHARS = 1_600
+MAX_SESSION_MEMORY_FACTS = 6
+MAX_PERSONAL_MEMORY_CONTEXT_CHARS = 1_600
+MAX_PERSONAL_MEMORY_CONTEXT_ITEMS = 5
+MAX_ASSISTANT_REWRITE_CONTEXT_CHARS = 800
+MAX_REWRITE_QUERY_CHARS = 240
+
+ENGLISH_FOLLOW_UP_RE = re.compile(
+    r"^(?:and\s+then|then|what\s+about|how\s+about|continue|tell\s+me\s+more)\b", re.IGNORECASE
+)
+ENGLISH_ASSISTANT_REFERENCE_RE = re.compile(
+    r"\b(?:first|second|third|previous|former|latter)\s+(?:step|option|approach|plan)\b", re.IGNORECASE
+)
+CHINESE_FOLLOW_UP_PREFIXES = ("那", "那么", "继续", "上述", "前面", "刚才", "上一", "下一步")
+CHINESE_ASSISTANT_REFERENCES = (
+    "第一步",
+    "第二步",
+    "第三步",
+    "前一种方案",
+    "后一种方案",
+    "你刚才的回答",
+)
+COMPARISON_RE = re.compile(r"(?:区别|对比|比较|优缺点|\bvs\.?\b|\bversus\b|\bcompare\b)", re.IGNORECASE)
+MULTI_CONSTRAINT_RE = re.compile(
+    r"(?:在.*情况下|当.*时|同时|分别|以及|并且|\bwhen\b.*\b(?:and|or)\b|\bwith\b.*\b(?:and|or)\b)",
+    re.IGNORECASE,
+)
+DIAGNOSTIC_ORDER_RE = re.compile(
+    r"(?:排查.*(?:顺序|步骤)|先.*再|\b(?:diagnos|troubleshoot|investigat)\w*\b.*\b(?:order|step)\b)",
+    re.IGNORECASE,
+)
+EXPLANATION_PREFIX_RE = re.compile(
+    r"^(?:explanation|answer|rewritten\s+query|here(?:'s| is)|the\s+(?:query|answer)|解释|答案|改写(?:后的)?查询)\s*[:：]",
+    re.IGNORECASE,
+)
 
 
 class RagState(TypedDict, total=False):
     session_id: str
     question: str
     rewritten_question: str
+    rewrite_debug: dict[str, Any]
     history: list[dict[str, str]]
+    session_memory: dict[str, Any]
+    personal_memories: list[dict[str, Any]]
     scenario: str | None
     model: str | None
     top_k: int
@@ -33,6 +74,7 @@ class RagState(TypedDict, total=False):
     context_filter: dict[str, Any]
     context_judgement: dict[str, Any]
     verification: dict[str, Any]
+    answer_retry_attempts: int
     sources: list[Source]
     retrieval_debug: dict[str, Any]
     answer: str
@@ -40,15 +82,26 @@ class RagState(TypedDict, total=False):
 
 
 class RagService:
-    def __init__(self, settings: Settings, index: HybridIndex, history: HistoryStore) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        index: HybridIndex,
+        history: HistoryStore,
+        *,
+        memory_service: Any | None = None,
+        personal_memory_service: Any | None = None,
+    ) -> None:
         self.settings = settings
         self.index = index
         self.history = history
+        self.memory_service = memory_service
+        self.personal_memory_service = personal_memory_service
         self.graph = self._build_graph()
 
     def chat(
         self,
         *,
+        actor: Actor | None = None,
         message: str,
         session_id: str | None = None,
         scenario: str | None = None,
@@ -57,12 +110,53 @@ class RagService:
         agentic: bool = False,
     ) -> ChatResponse:
         resolved_session_id = session_id or str(uuid.uuid4())
-        history = self.history.load(resolved_session_id)
+        memory_authorized = False
+        personal_memory_authorized = False
+        if session_id is None:
+            history = []
+            # The generated identifier is new for this authenticated turn; it will be
+            # durably claimed by this same actor before any personal-memory write.
+            personal_memory_authorized = actor is not None and hasattr(self.history, "append_for_actor")
+        elif actor is not None and hasattr(self.history, "load_for_actor"):
+            history = self.history.load_for_actor(actor, resolved_session_id)
+            memory_authorized = True
+            personal_memory_authorized = self._actor_owns_session(actor, resolved_session_id)
+        else:
+            history = self.history.load(resolved_session_id)
+        session_memory: dict[str, Any] = {"summary": "", "facts": []}
+        if memory_authorized and self.memory_service is not None:
+            try:
+                session_memory = self.memory_service.load_context(resolved_session_id)
+            except Exception:
+                # Session memory is optional context, never a chat availability dependency.
+                session_memory = {"summary": "", "facts": []}
+        personal_memories: list[dict[str, Any]] = []
+        personal_memory_debug: dict[str, Any] | None = None
+        personal_memory_enabled = bool(getattr(self.settings, "personal_memory_enabled", True))
+        personal_memory_limit = min(
+            max(int(getattr(self.settings, "personal_memory_retrieval_max_items", MAX_PERSONAL_MEMORY_CONTEXT_ITEMS)), 1),
+            MAX_PERSONAL_MEMORY_CONTEXT_ITEMS,
+        )
+        if personal_memory_enabled and personal_memory_authorized and self.personal_memory_service is not None and actor is not None:
+            try:
+                personal_memories = self.personal_memory_service.active_for_retrieval(
+                    actor, str(actor.user_id), limit=personal_memory_limit
+                )
+                personal_memory_debug = {
+                    "retrieval_status": "active" if personal_memories else "empty",
+                    "retrieved_count": len(personal_memories),
+                }
+            except Exception:
+                # Personal memory is optional context, never a chat availability dependency.
+                personal_memories = []
+                personal_memory_debug = {"retrieval_status": "unavailable", "retrieved_count": 0}
         state = self.graph.invoke(
             {
                 "session_id": resolved_session_id,
                 "question": message,
                 "history": history,
+                "session_memory": _bounded_session_memory(session_memory),
+                "personal_memories": _bounded_personal_memories(personal_memories),
                 "scenario": scenario,
                 "model": model,
                 "top_k": top_k or self.settings.final_top_k,
@@ -71,14 +165,64 @@ class RagService:
             config={"configurable": {"thread_id": resolved_session_id}},
         )
         answer = state["answer"]
-        self.history.append(resolved_session_id, "user", message)
-        self.history.append(resolved_session_id, "assistant", answer)
+        if actor is not None and hasattr(self.history, "append_for_actor"):
+            self.history.append_for_actor(actor, resolved_session_id, "user", message)
+            self.history.append_for_actor(actor, resolved_session_id, "assistant", answer)
+            memory_write_authorized = True
+        else:
+            self.history.append(resolved_session_id, "user", message)
+            self.history.append(resolved_session_id, "assistant", answer)
+            memory_write_authorized = False
+        personal_memory_write_authorized = (
+            actor is not None
+            and hasattr(self.history, "append_for_actor")
+            and (personal_memory_authorized or session_id is None)
+        )
+        if (memory_authorized or memory_write_authorized) and self.memory_service is not None:
+            try:
+                self.memory_service.record_turn(
+                    resolved_session_id,
+                    message,
+                    answer,
+                    prior_context=session_memory,
+                )
+            except Exception:
+                # A failed extraction or memory write must not change a completed response.
+                pass
+        if personal_memory_enabled and personal_memory_write_authorized and self.personal_memory_service is not None and actor is not None:
+            try:
+                # This runs only after the user turn is durably associated with its owner.
+                write_result = self.personal_memory_service.record_user_message(
+                    actor, str(actor.user_id), resolved_session_id, message
+                )
+                if personal_memory_debug is not None:
+                    personal_memory_debug.update(
+                        write_status="saved" if getattr(write_result, "error", None) is None else "unavailable",
+                        written_count=int(getattr(write_result, "source_saved", 0)),
+                        index_pending_count=int(getattr(write_result, "index_pending", 0)),
+                    )
+            except Exception:
+                # A failed extraction or memory write must not change a completed response.
+                if personal_memory_debug is not None:
+                    personal_memory_debug.update(write_status="unavailable", written_count=0, index_pending_count=0)
+        retrieval_debug = state.get("retrieval_debug", {})
+        if personal_memory_debug is not None:
+            retrieval_debug = _with_personal_memory_telemetry(retrieval_debug, personal_memory_debug)
         return ChatResponse(
             session_id=resolved_session_id,
             answer=answer,
             sources=state.get("sources", []),
-            retrieval_debug=state.get("retrieval_debug", {}),
+            retrieval_debug=retrieval_debug,
         )
+
+    def _actor_owns_session(self, actor: Actor, session_id: str) -> bool:
+        """Require strict self-ownership before personal memory is read or written."""
+        if not hasattr(self.history, "is_owned_by_actor"):
+            return False
+        try:
+            return bool(self.history.is_owned_by_actor(actor, session_id))
+        except Exception:
+            return False
 
     def _build_graph(self):
         graph = StateGraph(RagState)
@@ -116,7 +260,11 @@ class RagService:
             self._route_after_generate,
             {"verify": "verify_answer", "end": END},
         )
-        graph.add_edge("verify_answer", END)
+        graph.add_conditional_edges(
+            "verify_answer",
+            self._route_after_verification,
+            {"retry": "agentic_retrieve", "end": END},
+        )
         return graph.compile()
 
     def _route_after_rewrite(self, state: RagState) -> str:
@@ -127,22 +275,58 @@ class RagService:
         return "retrieve" if _coerce_bool(plan.get("needs_retrieval"), default=True) else "direct"
 
     def _rewrite_question(self, state: RagState) -> RagState:
-        question = state["question"]
-        history = state.get("history", [])
-        if not history:
-            return {"rewritten_question": question}
-        previous_questions = [
-            item["content"]
-            for item in reversed(history)
-            if item.get("role") == "user" and item.get("content")
-        ]
-        if not previous_questions:
-            return {"rewritten_question": question}
+        question = _normalized_query(state["question"])
+        prior_user, prior_answer = _latest_prior_turn(state.get("history", []), question)
+        deterministic_query = _deterministic_retrieval_query(question, prior_user, prior_answer)
+        mode = "follow_up" if deterministic_query != question else "passthrough"
+        llm_called = False
+        fallback_used = False
+        rewritten_question = deterministic_query
+
+        if _is_complex_question(question):
+            mode = "llm"
+            llm_called = True
+            try:
+                llm = get_chat_model(
+                    self.settings,
+                    state.get("model"),
+                    temperature=0,
+                    timeout=10,
+                    max_retries=0,
+                    thinking=False,
+                    max_tokens=160,
+                )
+                response = llm.invoke(
+                    [
+                        SystemMessage(
+                            content=(
+                                "Rewrite the user's request into one concise retrieval query. "
+                                "Return the query only: no explanation, JSON, Markdown, or list."
+                            )
+                        ),
+                        HumanMessage(
+                            content=_rewrite_prompt(question, prior_user, prior_answer)
+                        ),
+                    ]
+                )
+                valid_output = _valid_rewrite_output(
+                    _response_text(getattr(response, "content", ""))
+                )
+                if valid_output is None:
+                    fallback_used = True
+                else:
+                    rewritten_question = valid_output
+            except Exception:
+                fallback_used = True
+
         return {
-            "rewritten_question": (
-                f"上一轮用户问题：{previous_questions[0]}\n"
-                f"当前追问：{question}"
-            )
+            "rewritten_question": rewritten_question,
+            "rewrite_debug": _rewrite_telemetry(
+                mode,
+                llm_called=llm_called,
+                fallback_used=fallback_used,
+                query=rewritten_question,
+            ),
         }
 
     def _retrieve(self, state: RagState) -> RagState:
@@ -154,6 +338,17 @@ class RagService:
             final_top_k=state.get("top_k") or self.settings.final_top_k,
             rrf_k=self.settings.rrf_k,
         )
+        debug = dict(debug or {})
+        if state.get("rewrite_debug"):
+            debug["rewrite"] = state["rewrite_debug"]
+        sources, selection_debug = self._select_context_sources(
+            sources,
+            max_sources=state.get("top_k") or self.settings.final_top_k,
+            score_filter_enabled=(
+                debug.get("rerank_applied") is True and not debug.get("rerank_error")
+            ),
+        )
+        debug["context_selection"] = selection_debug
         return {"sources": sources, "retrieval_debug": debug}
 
     def _plan_retrieval(self, state: RagState) -> RagState:
@@ -231,48 +426,101 @@ class RagService:
         queries = _exclude_attempted_queries(base_queries, attempted_queries)
         if not queries:
             queries = base_queries
-        merged_sources: list[Source] = []
+        candidates: list[Source] = []
         seen_chunk_ids: set[str] = set()
         retrievals: list[dict[str, Any]] = []
         final_top_k = state.get("top_k") or self.settings.final_top_k
         if attempt > 1:
             for source in state.get("sources", []):
-                if source.chunk_id in seen_chunk_ids:
-                    continue
-                seen_chunk_ids.add(source.chunk_id)
-                merged_sources.append(source)
-                if len(merged_sources) >= final_top_k:
-                    break
+                if source.chunk_id not in seen_chunk_ids:
+                    seen_chunk_ids.add(source.chunk_id)
+                    candidates.append(source)
+        candidate_top_k = max(final_top_k, min(final_top_k * MAX_AGENTIC_QUERIES, self.settings.dense_top_k))
         for query in queries:
             sources, debug = self.index.search(
                 query,
                 scenario=state.get("scenario"),
                 dense_top_k=self.settings.dense_top_k,
                 bm25_top_k=self.settings.bm25_top_k,
-                final_top_k=final_top_k,
+                final_top_k=candidate_top_k,
                 rrf_k=self.settings.rrf_k,
+                apply_rerank=False,
             )
             retrievals.append({"query": query, "debug": debug, "source_count": len(sources)})
             for source in sources:
                 if source.chunk_id in seen_chunk_ids:
                     continue
                 seen_chunk_ids.add(source.chunk_id)
-                merged_sources.append(source)
-                if len(merged_sources) >= final_top_k:
-                    break
-            if len(merged_sources) >= final_top_k:
-                break
+                candidates.append(source)
+        merged_sources, union_rerank_error = self._rerank_agentic_candidates(
+            fallback_query, candidates, final_top_k
+        )
+        merged_sources, selection_debug = self._select_context_sources(
+            merged_sources,
+            max_sources=final_top_k,
+            score_filter_enabled=(
+                callable(getattr(self.index, "rerank_sources", None))
+                and union_rerank_error is None
+            ),
+        )
         agentic_debug = {
             "attempt": attempt,
             "queries": queries,
             "retry_strategy": retry_strategy,
             "retrievals": retrievals,
             "source_count": len(merged_sources),
+            "candidate_count": len(candidates),
+            "union_rerank_error": union_rerank_error,
         }
-        debug = _with_agentic_attempt(state.get("retrieval_debug"), agentic_debug)
+        retrieval_debug = state.get("retrieval_debug")
+        if state.get("rewrite_debug"):
+            retrieval_debug = dict(retrieval_debug or {})
+            retrieval_debug["rewrite"] = state["rewrite_debug"]
+        debug = _with_agentic_attempt(retrieval_debug, agentic_debug)
         debug["retrieval_backend"] = "agentic_milvus_hybrid"
         debug["index_operation"] = "search_only"
+        debug["context_selection"] = selection_debug
         return {"sources": merged_sources, "retrieval_attempts": attempt, "retrieval_debug": debug}
+
+    def _rerank_agentic_candidates(
+        self, query: str, candidates: list[Source], final_top_k: int
+    ) -> tuple[list[Source], str | None]:
+        rerank_sources = getattr(self.index, "rerank_sources", None)
+        if callable(rerank_sources):
+            return rerank_sources(query, candidates, final_top_k)
+        return candidates[:final_top_k], None
+
+    def _select_context_sources(
+        self,
+        sources: list[Source],
+        *,
+        max_sources: int,
+        score_filter_enabled: bool,
+    ) -> tuple[list[Source], dict[str, Any]]:
+        enabled = bool(getattr(self.settings, "adaptive_context_enabled", True))
+        if not enabled:
+            return sources, {
+                "candidate_count": len(sources),
+                "selected_count": len(sources),
+                "dropped_count": 0,
+                "strategy": "disabled",
+                "score_cutoff": None,
+                "score_filter_enabled": False,
+                "score_filter_applied": False,
+                "used_chars": sum(len(source.text) for source in sources),
+                "configured_max_sources": max_sources,
+                "configured_min_sources": getattr(self.settings, "adaptive_context_min_sources", 2),
+                "configured_score_ratio": getattr(self.settings, "adaptive_context_score_ratio", 0.5),
+                "configured_max_chars": getattr(self.settings, "adaptive_context_max_chars", 7200),
+            }
+        return select_context_sources(
+            sources,
+            max_sources=max_sources,
+            min_sources=int(getattr(self.settings, "adaptive_context_min_sources", 2)),
+            score_ratio=float(getattr(self.settings, "adaptive_context_score_ratio", 0.5)),
+            max_chars=int(getattr(self.settings, "adaptive_context_max_chars", 7200)),
+            score_filter_enabled=score_filter_enabled,
+        )
 
     def _filter_context(self, state: RagState) -> RagState:
         sources = state.get("sources", [])
@@ -450,9 +698,22 @@ class RagService:
     def _route_after_generate(self, state: RagState) -> str:
         return "verify" if state.get("agentic") else "end"
 
+    def _route_after_verification(self, state: RagState) -> str:
+        verification = state.get("verification") or {}
+        if (
+            not _coerce_bool(verification.get("supported"), default=True)
+            and state.get("sources")
+            and int(state.get("retrieval_attempts") or 0) < MAX_AGENTIC_ATTEMPTS
+            and int(state.get("answer_retry_attempts") or 0) == 0
+        ):
+            return "retry"
+        return "end"
+
     def _generate(self, state: RagState) -> RagState:
         sources = state.get("sources", [])
         context = format_context(sources)
+        memory = _format_session_memory(state.get("session_memory"))
+        personal_memory = _format_personal_memories(state.get("personal_memories"))
         system = (
             "你是一个严谨的 RAG 问答助手。"
             "你的任务是根据提供的引用资料回答用户问题。"
@@ -469,6 +730,14 @@ class RagService:
             "流程类问题说明步骤；"
             "规则类问题说明条件、限制和例外；"
             "事实类问题直接给出结论；"
+        )
+        user += (
+            "\n\nUnverified session context (not knowledge-base evidence; do not cite it):\n"
+            f"{memory or '(none)'}"
+        )
+        user += (
+            "\n\nPersonal user-provided context (not knowledge-base evidence; do not cite it):\n"
+            f"{personal_memory or '(none)'}"
         )
         user += "\nAnswer in the same language as the user's question."
         llm = get_chat_model(
@@ -511,6 +780,18 @@ class RagService:
             "reason": str(data.get("reason") or "") if data else "",
         }
         result: RagState = {"verification": verification}
+        if not supported and sources and int(state.get("answer_retry_attempts") or 0) == 0:
+            fallback_query = state.get("rewritten_question") or state["question"]
+            result["answer_retry_attempts"] = 1
+            result["context_judgement"] = {
+                "retry_strategy": "query_rewrite",
+                "retry_queries": _build_retry_queries(
+                    state,
+                    "query_rewrite",
+                    fallback_query,
+                    _attempted_queries(state.get("retrieval_debug")),
+                ),
+            }
         result["retrieval_debug"] = _with_agentic_debug(state.get("retrieval_debug"), verification=verification)
         return result
 
@@ -534,6 +815,186 @@ class RagService:
         except Exception:
             return None
         return _parse_json_object(str(response.content))
+
+
+def _normalized_query(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _latest_prior_turn(
+    history: list[dict[str, str]], current_question: str
+) -> tuple[str | None, str | None]:
+    current = _normalized_query(current_question)
+    selected_index: int | None = None
+    selected_question: str | None = None
+    for index in range(len(history) - 1, -1, -1):
+        item = history[index]
+        content = item.get("content")
+        if item.get("role") != "user" or not isinstance(content, str):
+            continue
+        normalized = _normalized_query(content)
+        if normalized and normalized != current:
+            selected_index = index
+            selected_question = normalized
+            break
+    if selected_index is None or selected_question is None:
+        return None, None
+    for item in history[selected_index + 1 :]:
+        if item.get("role") == "user":
+            break
+        content = item.get("content")
+        if item.get("role") == "assistant" and isinstance(content, str):
+            answer = _normalized_query(content)
+            if answer:
+                return selected_question, answer[:MAX_ASSISTANT_REWRITE_CONTEXT_CHARS]
+    return selected_question, None
+
+
+def _is_explicit_follow_up(question: str) -> bool:
+    normalized = _normalized_query(question)
+    return normalized.startswith(CHINESE_FOLLOW_UP_PREFIXES) or bool(ENGLISH_FOLLOW_UP_RE.match(normalized))
+
+
+def _references_assistant_answer(question: str) -> bool:
+    normalized = _normalized_query(question)
+    return any(marker in normalized for marker in CHINESE_ASSISTANT_REFERENCES) or bool(
+        ENGLISH_ASSISTANT_REFERENCE_RE.search(normalized)
+    )
+
+
+def _is_follow_up(question: str) -> bool:
+    return _is_explicit_follow_up(question) or _references_assistant_answer(question)
+
+
+def _deterministic_retrieval_query(
+    question: str, prior_user: str | None, prior_answer: str | None
+) -> str:
+    current = _normalized_query(question)
+    if not prior_user or not _is_follow_up(current):
+        return current
+    parts = [f"Previous user question: {prior_user}"]
+    if prior_answer and _references_assistant_answer(current):
+        parts.append(f"Previous assistant answer: {prior_answer}")
+    parts.append(f"Current follow-up: {current}")
+    return "\n".join(parts)
+
+
+def _is_complex_question(question: str) -> bool:
+    normalized = _normalized_query(question)
+    return bool(
+        COMPARISON_RE.search(normalized)
+        or MULTI_CONSTRAINT_RE.search(normalized)
+        or DIAGNOSTIC_ORDER_RE.search(normalized)
+    )
+
+
+def _rewrite_prompt(question: str, prior_user: str | None, prior_answer: str | None) -> str:
+    parts = [f"Current question: {question}"]
+    if prior_user and _is_follow_up(question):
+        parts.append(f"Previous user question: {prior_user}")
+        if prior_answer and _references_assistant_answer(question):
+            parts.append(f"Previous assistant answer: {prior_answer}")
+    return "\n".join(parts)
+
+
+def _response_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "") if isinstance(part, dict) and isinstance(part.get("text"), str) else ""
+            for part in content
+        ).strip()
+    return ""
+
+
+def _valid_rewrite_output(value: str) -> str | None:
+    normalized = value.strip()
+    if not 2 <= len(normalized) <= MAX_REWRITE_QUERY_CHARS or "\n" in normalized or "\r" in normalized:
+        return None
+    if re.match(r"^(?:[-*+]\s+|#{1,6}\s+|```)", normalized):
+        return None
+    if EXPLANATION_PREFIX_RE.match(normalized):
+        return None
+    try:
+        json.loads(normalized)
+    except (TypeError, ValueError):
+        return normalized
+    return None
+
+
+def _rewrite_telemetry(
+    mode: str, *, llm_called: bool, fallback_used: bool, query: str
+) -> dict[str, Any]:
+    return {
+        "mode": mode,
+        "llm_called": llm_called,
+        "fallback_used": fallback_used,
+        "query_chars": len(query),
+    }
+
+
+def _bounded_session_memory(memory: Any) -> dict[str, Any]:
+    if not isinstance(memory, dict):
+        return {"summary": "", "facts": []}
+    summary = memory.get("summary")
+    facts = memory.get("facts")
+    return {
+        "summary": summary if isinstance(summary, str) else "",
+        "facts": facts if isinstance(facts, list) else [],
+    }
+
+
+def _format_session_memory(memory: Any) -> str:
+    """Render bounded dialogue context, deliberately separate from KB evidence."""
+    normalized = _bounded_session_memory(memory)
+    parts: list[str] = []
+    summary = normalized["summary"].strip()
+    if summary:
+        parts.append(f"Summary: {summary}")
+    fact_lines: list[str] = []
+    for fact in normalized["facts"]:
+        if not isinstance(fact, dict) or len(fact_lines) >= MAX_SESSION_MEMORY_FACTS:
+            continue
+        memory_type = fact.get("memory_type")
+        key = fact.get("key")
+        value = fact.get("value")
+        if not all(isinstance(item, str) and item.strip() for item in (memory_type, key, value)):
+            continue
+        fact_lines.append(f"{memory_type}: {key}={value}")
+    if fact_lines:
+        parts.append("Working memory: " + "; ".join(fact_lines))
+    return "\n".join(parts)[:MAX_SESSION_MEMORY_CONTEXT_CHARS]
+
+
+def _bounded_personal_memories(memories: Any) -> list[dict[str, str]]:
+    if not isinstance(memories, list):
+        return []
+    bounded: list[dict[str, str]] = []
+    for memory in memories:
+        if len(bounded) >= MAX_PERSONAL_MEMORY_CONTEXT_ITEMS or not isinstance(memory, dict):
+            continue
+        memory_type, key, value = memory.get("memory_type"), memory.get("key"), memory.get("value")
+        if all(isinstance(item, str) and item.strip() for item in (memory_type, key, value)):
+            bounded.append({"memory_type": memory_type, "key": key, "value": value})
+    return bounded
+
+
+def _format_personal_memories(memories: Any) -> str:
+    lines = [
+        f"{memory['memory_type']}: {memory['key']}={memory['value']}"
+        for memory in _bounded_personal_memories(memories)
+    ]
+    return "\n".join(lines)[:MAX_PERSONAL_MEMORY_CONTEXT_CHARS]
+
+
+def _with_personal_memory_telemetry(debug: dict[str, Any] | None, telemetry: dict[str, Any]) -> dict[str, Any]:
+    """Expose operational outcomes only; personal memory data never enters debug."""
+    safe_keys = {"retrieval_status", "retrieved_count", "write_status", "written_count", "index_pending_count"}
+    safe = {key: telemetry[key] for key in safe_keys if key in telemetry}
+    next_debug = dict(debug or {})
+    next_debug["personal_memory"] = safe
+    return next_debug
 
 
 def format_context(sources: list[Source]) -> str:
